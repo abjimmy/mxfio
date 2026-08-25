@@ -1,0 +1,14 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
+[test]
+ioengine=libmcfile
+bs=1M
+size=10G
+direct=1
+gpu_dev_ids=0
+maca_io=mcfile
+readwrite=write
+ramp_time=4
+numjobs=1
+end_fsync=1
+group_reporting

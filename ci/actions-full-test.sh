@@ -1,5 +1,7 @@
 #!/bin/bash
 # This script expects to be invoked from the base fio directory.
+#
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 set -eu
 
 main() {
@@ -19,6 +21,7 @@ main() {
     )
     args=(
         --debug
+        --junit-xml ut_results/fio-test-results.xml
     )
     if [ "${GITHUB_JOB}" == "build-containers" ]; then
         # io_uring is disabled in containers
@@ -52,7 +55,7 @@ main() {
     fi
 
     echo python3 t/run-fio-tests.py --skip "${skip[@]}" "${args[@]}"
-    python3 t/run-fio-tests.py -c --skip "${skip[@]}" "${args[@]}"
+    python3 t/run-fio-tests.py --skip "${skip[@]}" "${args[@]}"
     make -C doc html
 }
 

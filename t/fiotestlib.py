@@ -7,6 +7,8 @@ different sorts of fio tests.
 
 It also contains a test runner that runs an array of dictionary objects
 describing fio tests.
+
+2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """
 
 import os
@@ -18,6 +20,7 @@ import logging
 import platform
 import traceback
 import subprocess
+import time
 from pathlib import Path
 from fiotestcommon import get_file, SUCCESS_DEFAULT
 
@@ -373,7 +376,7 @@ class FioJobCmdTest(FioExeTest):
         return retval
 
 
-def run_fio_tests(test_list, test_env, args):
+def run_fio_tests(test_list, test_env, args, collect_details=False):
     """
     Run tests as specified in test_list.
     """
@@ -381,12 +384,29 @@ def run_fio_tests(test_list, test_env, args):
     passed = 0
     failed = 0
     skipped = 0
+    test_results = []
 
     for config in test_list:
+        test_start_time = time.time()
+        result = {
+            'test_id': config['test_id'],
+            'classname': config['test_class'].__name__,
+            'name': f"test_{config['test_id']:04d}",
+            'time': 0,
+            'status': 'passed',
+            'stdout': '',
+            'stderr': '',
+        }
+
         if (args.skip and config['test_id'] in args.skip) or \
            (args.run_only and config['test_id'] not in args.run_only) or \
            ('force_skip' in config and config['force_skip']):
             skipped = skipped + 1
+            result['status'] = 'skipped'
+            result['skip_reason'] = 'User request or override'
+            result['time'] = time.time() - test_start_time
+            if collect_details:
+                test_results.append(result)
             print(f"Test {config['test_id']} SKIPPED (User request or override)")
             continue
 
@@ -414,6 +434,8 @@ def run_fio_tests(test_list, test_env, args):
                 fio_pre_success=fio_pre_success,
                 output_format=output_format)
             desc = config['job']
+            result['name'] = config['job']
+            result['classname'] = config['test_class'].__name__
             parameters = config['parameters'] if 'parameters' in config else None
         elif issubclass(config['test_class'], FioJobCmdTest):
             if not 'success' in config:
@@ -425,6 +447,8 @@ def run_fio_tests(test_list, test_env, args):
                                         config['fio_opts'],
                                         test_env['basename'])
             desc = config['test_id']
+            result['name'] = f"cmd_test_{config['test_id']}"
+            result['classname'] = config['test_class'].__name__
             parameters = config
         elif issubclass(config['test_class'], FioExeTest):
             exe_path = os.path.join(test_env['fio_root'], config['exe'])
@@ -443,9 +467,16 @@ def run_fio_tests(test_list, test_env, args):
                     config['test_id'],
                     test_env['artifact_root'])
             desc = config['exe']
+            result['name'] = config['exe'].replace('/', '_').replace('\\', '_')
+            result['classname'] = config['test_class'].__name__
         else:
             print(f"Test {config['test_id']} FAILED: unable to process test config")
             failed = failed + 1
+            result['status'] = 'error'
+            result['error_reason'] = 'Unable to process test config'
+            result['time'] = time.time() - test_start_time
+            if collect_details:
+                test_results.append(result)
             continue
 
         if 'requirements' in config and not args.skip_req:
@@ -459,6 +490,11 @@ def run_fio_tests(test_list, test_env, args):
             if not reqs_met:
                 print(f"Test {config['test_id']} SKIPPED ({reason}) {desc}")
                 skipped = skipped + 1
+                result['status'] = 'skipped'
+                result['skip_reason'] = reason
+                result['time'] = time.time() - test_start_time
+                if collect_details:
+                    test_results.append(result)
                 continue
 
         try:
@@ -471,20 +507,36 @@ def run_fio_tests(test_list, test_env, args):
             test.passed = False
             test.failure_reason += str(e)
             logging.debug("Test %d exception:\n%s\n", config['test_id'], traceback.format_exc())
+            result['status'] = 'error'
+            result['error_reason'] = str(e)
+            result['error_details'] = traceback.format_exc()
+
         if test.passed:
-            result = "PASSED"
+            result_text = "PASSED"
             passed = passed + 1
+            result['status'] = 'passed'
             if hasattr(args, 'cleanup') and args.cleanup:
                 shutil.rmtree(test_env['artifact_root'] + f"/{config['test_id']:04d}", ignore_errors=True)
         else:
-            result = f"FAILED: {test.failure_reason}"
+            result_text = f"FAILED: {test.failure_reason}"
             failed = failed + 1
+            result['status'] = 'failed'
+            result['failure_reason'] = test.failure_reason
             contents, _ = get_file(test.filenames['stderr'])
             logging.debug("Test %d: stderr:\n%s", config['test_id'], contents)
+            result['stderr'] = contents
             contents, _ = get_file(test.filenames['stdout'])
             logging.debug("Test %d: stdout:\n%s", config['test_id'], contents)
-        print(f"Test {config['test_id']} {result} {desc}")
+            result['stdout'] = contents
+            result['failure_details'] = f"Stderr:\n{result['stderr']}\n\nStdout:\n{result['stdout']}"
+
+        result['time'] = time.time() - test_start_time
+        if collect_details:
+            test_results.append(result)
+        print(f"Test {config['test_id']} {result_text} {desc}")
 
     print(f"{passed} test(s) passed, {failed} failed, {skipped} skipped")
-
-    return passed, failed, skipped
+    if collect_details:
+        return passed, failed, skipped, test_results
+    else:
+        return passed, failed, skipped

@@ -11,6 +11,7 @@
 # USAGE
 # python3 run-fio-tests.py [-r fio-root] [-f fio-path] [-a artifact-root]
 #                           [--skip # # #...] [--run-only # # #...]
+#                           [--junit-xml /path/to/output.xml]
 #
 #
 # EXAMPLE
@@ -34,6 +35,7 @@
 # - kernel 4.19 or later for zoned null block devices (zbd tests)
 # - CUnit support (unittests)
 #
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """
 
 #
@@ -47,6 +49,9 @@ import time
 import shutil
 import logging
 import argparse
+import platform
+import xml.etree.ElementTree as ET
+from datetime import datetime
 import re
 from pathlib import Path
 from statsmodels.sandbox.stats.runs import runstest_1samp
@@ -916,6 +921,16 @@ TEST_LIST = [
         'requirements':     [],
     },
     {
+        'test_id':          3001,
+        'test_class':       FioJobFileTest,
+        'job':              't0030-mx.fio',
+        'success':          SUCCESS_DEFAULT,
+        'pre_job':          None,
+        'pre_success':      None,
+        'parameters':       ['--bandwidth-log'],
+        'requirements':     [Requirements.maca, Requirements.libmcfile],
+    },
+    {
         'test_id':          31,
         'test_class':       FioJobFileTest,
         'job':              't0031.fio',
@@ -1141,6 +1156,96 @@ TEST_LIST = [
     },
 ]
 
+def generate_junit_xml(test_results, output_file, start_time, end_time):
+    """Generate JUnit XML output similar to pytest."""
+
+    # Calculate total statistics
+    total_tests = len(test_results)
+    failures = sum(1 for result in test_results if result['status'] == 'failed')
+    errors = sum(1 for result in test_results if result['status'] == 'error')
+    skipped = sum(1 for result in test_results if result['status'] == 'skipped')
+    disabled = sum(1 for result in test_results if result['status'] == 'disabled')
+    passed = total_tests - failures - errors - skipped - disabled
+
+    # Root element
+    testsuites = ET.Element('testsuites')
+    testsuites.set('name', 'fio-tests')
+    testsuites.set('tests', str(total_tests))
+    testsuites.set('failures', str(failures))
+    testsuites.set('errors', str(errors))
+    testsuites.set('skipped', str(skipped))
+    testsuites.set('disabled', str(disabled))
+    testsuites.set('time', f'{(end_time - start_time).total_seconds():.3f}')
+    testsuites.set('timestamp', start_time.isoformat())
+
+    # Test suite element
+    testsuite = ET.SubElement(testsuites, 'testsuite')
+    testsuite.set('name', 'fio-test-suite')
+    testsuite.set('tests', str(total_tests))
+    testsuite.set('failures', str(failures))
+    testsuite.set('errors', str(errors))
+    testsuite.set('skipped', str(skipped))
+    testsuite.set('time', f'{(end_time - start_time).total_seconds():.3f}')
+    testsuite.set('timestamp', start_time.isoformat())
+
+    # Add individual test cases
+    for result in test_results:
+        testcase = ET.SubElement(testsuite, 'testcase')
+        testcase.set('classname', result['classname'])
+        testcase.set('name', result['name'])
+        testcase.set('time', f"{result['time']:.3f}")
+
+        if result['status'] == 'failed':
+            failure = ET.SubElement(testcase, 'failure')
+            failure.set('message', result.get('failure_reason', 'Test failed'))
+            failure.text = result.get('failure_details', '')
+        elif result['status'] == 'error':
+            error = ET.SubElement(testcase, 'error')
+            error.set('message', result.get('error_reason', 'Test error'))
+            error.text = result.get('error_details', '')
+        elif result['status'] == 'skipped':
+            skipped_elem = ET.SubElement(testcase, 'skipped')
+            skipped_elem.set('message', 'Skipped')
+            skipped_elem.text = result.get('skip_reason', 'Test skipped')
+
+        # Add stdout/stderr if available
+        if result.get('stdout'):
+            system_out = ET.SubElement(testcase, 'system-out')
+            system_out.text = result['stdout']
+        if result.get('stderr'):
+            system_err = ET.SubElement(testcase, 'system-err')
+            system_err.text = result['stderr']
+
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Created directory: {output_dir}")
+
+    # Write to file
+    tree = ET.ElementTree(testsuites)
+    # ET.indent() is only available in Python 3.9+, provide fallback for older versions
+    if hasattr(ET, 'indent'):
+        ET.indent(tree, space="  ", level=0)
+    else:
+        # Manual indentation for Python < 3.9
+        def indent_xml(elem, level=0):
+            i = "\n" + level * "  "
+            if len(elem):
+                if not elem.text or not elem.text.strip():
+                    elem.text = i + "  "
+                if not elem.tail or not elem.tail.strip():
+                    elem.tail = i
+                for elem in elem:
+                    indent_xml(elem, level + 1)
+                if not elem.tail or not elem.tail.strip():
+                    elem.tail = i
+            else:
+                if level and (not elem.tail or not elem.tail.strip()):
+                    elem.tail = i
+        indent_xml(testsuites)
+    tree.write(output_file, encoding='utf-8', xml_declaration=True)
+    print(f"JUnit XML output written to {output_file}")
 
 def parse_args():
     """Parse command-line arguments."""
@@ -1166,6 +1271,8 @@ def parse_args():
                         help='NVMe character device for **DESTRUCTIVE** testing (e.g., /dev/ng0n1)')
     parser.add_argument('-c', '--cleanup', action='store_true', default=False,
                         help='Delete artifacts for passing tests')
+    parser.add_argument('--junit-xml', action='store',
+                        help='output JUnit XML file')
     args = parser.parse_args()
 
     return args
@@ -1223,8 +1330,25 @@ def main():
               'artifact_root': artifact_root,
               'pass_through': pass_through,
               }
-    _, failed, _ = run_fio_tests(TEST_LIST, test_env, args)
-    sys.exit(failed)
+    # Track timing for XML output
+    start_time = datetime.now()
+
+    # Run tests with detailed collection if XML output is requested
+    collect_details = args.junit_xml is not None
+    if collect_details:
+        passed, failed, skipped, test_results = run_fio_tests(TEST_LIST, test_env, args, collect_details=True)
+    else:
+        passed, failed, skipped = run_fio_tests(TEST_LIST, test_env, args)
+
+    end_time = datetime.now()
+
+    # Generate JUnit XML if requested
+    if args.junit_xml and collect_details:
+        generate_junit_xml(test_results, args.junit_xml, start_time, end_time)
+    if args.junit_xml:
+        sys.exit(0)
+    else:
+        sys.exit(failed)
 
 
 if __name__ == '__main__':

@@ -198,6 +198,8 @@ dfs=""
 seed_buckets=""
 dynamic_engines="no"
 prefix=/usr/local
+maca="no"
+libmcfile="no"
 
 # parse options
 for opt do
@@ -254,6 +256,10 @@ for opt do
   --enable-cuda) cuda="yes"
   ;;
   --enable-libcufile) libcufile="yes"
+  ;;
+  --enable-maca) maca="yes"
+  ;;
+  --enable-libmcfile) libmcfile="yes"
   ;;
   --disable-native) disable_native="yes"
   ;;
@@ -341,6 +347,8 @@ if test "$show_help" = "yes" ; then
   echo "--enable-asan           Enable address sanitizer"
   echo "--seed-buckets=         Number of seed buckets for the refill-buffer"
   echo "--disable-tls		Disable __thread local storage"
+  echo "--enable-maca           Enable GPUDirect RDMA support for Metax Chips"
+  echo "--enable-libmcfile      Enable GPUDirect Storage metax mcFile support"
   exit $exit_val
 fi
 
@@ -2876,6 +2884,61 @@ EOF
 fi
 
 ##########################################
+# maca probe
+if test "$maca" != "no" ; then
+  if [ -z $MACA_PATH ]; then
+    echo "Please set enviroment variable MACA_PATH"
+    exit 1
+  fi
+
+CFLAGS="$CFLAGS -I${MACA_PATH}/include"
+CFLAGS="$CFLAGS -I${MACA_PATH}/include/mcr"
+CFLAGS="$CFLAGS -I${MACA_PATH}/include/common"
+LDFLAGS="$LDFLAGS -L${MACA_PATH}/lib"
+
+cat > $TMPC << EOF
+#include <mc_runtime.h>
+int main(int argc, char **argv)
+{
+  return mcInit(0);
+}
+EOF
+  if compile_prog "" "-lmcruntime" "maca"; then
+    maca="yes"
+    LIBS="-lmcruntime $LIBS"
+  else
+    if test "$maca" = "yes" ; then
+      feature_not_found "maca" ""
+    fi
+    maca="no"
+  fi
+fi
+print_config "maca" "$maca"
+
+##########################################
+# libmcfile probe
+if test "$libmcfile" != "no" ; then
+cat > $TMPC << EOF
+#include <mcfile.h>
+
+int main(int argc, char* argv[]) {
+   mcFileDriverOpen();
+   return 0;
+}
+EOF
+  if compile_prog "" "-lmcruntime -lmcfile -ldl" "libmcfile"; then
+    libmcfile="yes"
+    LIBS="-lmcruntime -lmcfile -ldl $LIBS"
+  else
+    if test "$libmcfile" = "yes" ; then
+      feature_not_found "libmcfile" ""
+    fi
+    libmcfile="no"
+  fi
+fi
+print_config "libmcfile" "$libmcfile"
+
+##########################################
 # check for cc -march=native
 build_native="no"
 cat > $TMPC << EOF
@@ -3375,6 +3438,12 @@ if test "$libcufile" = "yes" ; then
 fi
 if test "$cuda13" = "yes" ; then
   output_sym "CONFIG_CUDA13"
+fi
+if test "$maca" = "yes" ; then
+  output_sym "CONFIG_MACA"
+fi
+if test "$libmcfile" = "yes" ; then
+  output_sym "CONFIG_LIBMCFILE"
 fi
 if test "$dfs" = "yes" ; then
   output_sym "CONFIG_DFS"

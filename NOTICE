@@ -1,0 +1,19 @@
+The mxfio project is modified from fio (https://github.com/axboe/fio).
+Please see the COPYING for the license for this project.
+
+This project contains third-party components with separate copyright notices and license terms. Your use of the source code for the these third-party components are subject to the terms and conditions of their licenses.
+
+The following files may have been modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026.  Modification copyright 2026 MetaX Integrated Circuits (Shanghai) Co.,Ltd.
+
+FIO-VERSION-GEN
+configure
+Makefile
+ci/actions-full-test.sh
+t/fiotestlib.py
+t/run-fio-tests.py
+
+The following files are newly added by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026.   All rights reserved.
+
+README.md
+engines/libmcfile.c
+t/jobs/t0030-mx.fio
