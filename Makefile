@@ -123,6 +123,7 @@ ifdef CONFIG_LIBCUFILE
 endif
 ifdef CONFIG_LIBMCFILE
   SOURCE += engines/libmcfile.c
+  SOURCE += engines/libmcfile_async.c
 endif
 ifdef CONFIG_LINUX_SPLICE
   SOURCE += engines/splice.c

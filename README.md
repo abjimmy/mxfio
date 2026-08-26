@@ -27,6 +27,8 @@ export MACA_PATH=/opt/maca
 接着执行如下指令：
 
 ```bash
+mkdir -p build
+cd build
 ../configure --enable-maca --enable-libmcfile
 # 执行编译前的配置,自定义一部分功能是否开启并且检测当前平台是否有其余功能的对应支持，结果打印到终端并存储到同一目录下的config-host.h
 # 如需启用Huawei NDS file system，将nds_api.h（其中需注释掉enum nds_file_op_err_s定义，因其在cudatocann.h中重新封装）和nds_file.h拷贝至mxFIO目录，并将libndsfs.so拷贝至/opt/maca/lib, 执行../configure --enable-cuda --enable-libcufile --enable-nds

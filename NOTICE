@@ -16,4 +16,5 @@ The following files are newly added by MetaX Integrated Circuits (Shanghai) Co.,
 
 README.md
 engines/libmcfile.c
+engines/libmcfile_async.c
 t/jobs/t0030-mx.fio
