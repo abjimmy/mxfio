@@ -1,0 +1,21 @@
+; Replace target/NQN/host identity for your environment.
+; The filename is a fio label; no /dev/nvme or kernel initiator is needed.
+[global]
+ioengine=./engines/gids/build/gids.so
+thread=1
+gids_transport=rdma
+gids_gpu=0
+gids_traddr=10.190.0.47
+gids_trsvcid=4421
+gids_subnqn=nqn.2026-09.local.kclove:nvme47.nvme0n1
+gids_hostnqn=nqn.2014-08.org.nvmexpress:uuid:cc072fcf-2efd-4582-84e0-687520dcfb39
+gids_nsid=1
+rw=randread
+bs=128k
+size=64M
+offset=1G
+iodepth=8
+iodepth_batch_submit=8
+
+[rdma-read]
+filename=rdma-namespace

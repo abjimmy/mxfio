@@ -1,5 +1,6 @@
  *Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.*
 # mxfio
+
 fio（Flexible I/O Tester）是一款功能强大且灵活的开源磁盘 I/O 性能测试工具。它可以对块设备（比如磁盘、固态硬盘等）以及文件系统进行多种类型的 I/O 性能测试，在存储系统的性能评估、优化等方面有着广泛应用。
 
 fio支持多种I/O引擎，其中包括libcufile和psync。我们参照libcufile engine的实现在fio中增加了MACA libmcfile engine（可执行文件仍名为fio，仅在version中通过mxfio进行区别），使用libmcfile引擎测试MACA MAS特性。
@@ -79,3 +80,7 @@ mxfio 测试完成后会输出详细的测试结果报告，常见的指标有�
 + **平均响应时间（Average Latency）**：反映了从发出 I/O 请求到得到响应所花费的平均时间，单位一般是毫秒（ms），较短的平均响应时间意味着存储设备能够快速响应读写请求。
 
 当前移植的mxfio基于开源fio-3.42版本[axboe/fio](https://github.com/axboe/fio/tree/fio-3.42)。
+
+#### 可选外部 ioengine：GiDS
+
+GiDS 支持 GPU 发起的本地 NVMe / NVMe-RDMA I/O。插件独立构建为 `gids.so`，通过 `--ioengine=/path/to/gids.so` 加载。构建、部署和测试说明见 [MetaX GiDS plugin](engines/gids/README.md)。

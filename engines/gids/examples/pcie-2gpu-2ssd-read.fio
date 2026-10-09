@@ -1,0 +1,23 @@
+; Fill GIDS_NS0, GIDS_NS1, GIDS_BS and AP_OUT as described in MULTIGPU_MULTISSD.md.
+; Both visible GPUs use one separate, idle NVMe controller each.
+[global]
+ioengine=./engines/gids/build/gids.so
+thread=1
+gids_transport=pcie
+rw=read
+bs=${GIDS_BS}
+size=${GIDS_BS}
+offset=1G
+loops=5200
+iodepth=1
+group_reporting=0
+
+[gpu0-ssd0]
+filename=${GIDS_NS0}
+gids_gpu=0
+gids_ap_latency=${AP_OUT}/gpu0-ssd0.csv
+
+[gpu1-ssd1]
+filename=${GIDS_NS1}
+gids_gpu=1
+gids_ap_latency=${AP_OUT}/gpu1-ssd1.csv

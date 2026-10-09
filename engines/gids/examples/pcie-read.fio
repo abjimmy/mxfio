@@ -1,0 +1,17 @@
+; Run from the mxFIO root; fio loads the shared object as an external engine.
+; Requires the snvme modules and an unused, whole PCIe NVMe namespace.
+[global]
+ioengine=./engines/gids/build/gids.so
+thread=1
+gids_transport=pcie
+gids_gpu=0
+rw=randread
+bs=4k
+size=64M
+offset=1G
+iodepth=8
+iodepth_batch_submit=8
+group_reporting=1
+
+[pcie-read]
+filename=/dev/nvme0n1
