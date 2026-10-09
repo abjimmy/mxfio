@@ -77,6 +77,10 @@ test:
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread tests/pcie_owner_test.cpp -o $(BUILD)/pcie_owner_test
 	$(BUILD)/pcie_owner_test
 	python3 scripts/check_vendor.py
+	python3 tests/config_test.py
+	python3 tests/profile_test.py
+	python3 tests/baseline_test.py
+	python3 tests/baseline_command_test.py
 clean:
 	rm -rf -- $(BUILD)
 $(OBJ): $(GIDS_CONFIG)
