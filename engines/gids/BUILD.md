@@ -3,6 +3,8 @@
 Use a Linux checkout, GCC/G++, make, Python 3, MACA 3.9.0 or later with
 cu-bridge, and matching runtime/driver libraries. Rebuild with the required
 SDK for the target GPU architecture; upgrading only the runtime is insufficient.
+The default `GIDS_RDMA=off` build supports PCIe
+without RDMA headers, libraries or a network adapter.
 
 From the repository root:
 
@@ -34,7 +36,7 @@ Use a fresh `BUILD` directory when changing SDKs, such as
 
 Each command must succeed; `ldd` must show no `not found` entries. The `test`
 target runs the checks listed in the Makefile, including the fio scheduler
-callbacks, batch scheduling, AP-plan and PCIe
+callbacks, batch scheduling, RDMA completion tracking, wire, AP-plan and PCIe
 owner tests and vendor hashes. The owner test covers delayed
 reuse after namespace removal, path replacement (including dangling links),
 and final release.
@@ -48,6 +50,44 @@ For optional existing libmcfile baselines, configure fio with
 environment documented in the root README. GiDS itself does not require
 libmcfile. Standalone dependency validation remains available in
 [vendor/README.md](vendor/README.md).
+
+## Optional mlx5 RDMA backend
+
+Use `GIDS_RDMA=mlx5` to build both PCIe and GPU-initiated NVMe-oF/RDMA.
+This requires the development headers/libraries for libibverbs, librdmacm
+and libmlx5, including `infiniband/mlx5dv.h`. Use packages matching the
+installed RDMA stack; an existing OFED installation should use its
+accompanying development packages. Compilation does not require a NIC;
+RDMA I/O requires an mlx5 device and GPU peer-memory registration support.
+Other vendors' NICs are not supported by this GPU queue implementation.
+
+```bash
+make -C engines/gids GIDS_RDMA=mlx5 -j8
+./fio --enghelp="$PWD/engines/gids/build/gids.so"
+ldd engines/gids/build/gids.so
+```
+
+`gids_transport` help identifies the compiled backend; RDMA connection
+options appear only in the mlx5 build. A PCIe-only build rejects
+`gids_transport=rdma` before initializing devices.
+
+Pass the selection on every build invocation, or export `GIDS_RDMA=mlx5`
+in the build shell. Omitting it uses `off`. Switching modes in the same
+`BUILD` directory rebuilds the objects and relinks the plugin automatically;
+do not build two configurations concurrently in the same directory.
+Use separate `BUILD` directories to retain both binaries.
+
+To return to PCIe-only and check that RDMA libraries are absent:
+
+```bash
+make -C engines/gids GIDS_RDMA=off -j8
+./fio --enghelp="$PWD/engines/gids/build/gids.so"
+readelf -d engines/gids/build/gids.so
+```
+
+The `NEEDED` entries must not contain `libibverbs`, `librdmacm` or `libmlx5`.
+The `off`/`mlx5` selection is explicit; it does not auto-detect the installed
+NIC or silently switch transports.
 
 ## Device checks
 

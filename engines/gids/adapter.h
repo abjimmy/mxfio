@@ -9,10 +9,11 @@ extern "C" {
 struct gids;
 /* A drained batch uses one unique 16-bit NVMe CID per fio slot. */
 #define GIDS_PCIE_MAX_DEPTH 65536u
+#define GIDS_RDMA_MAX_DEPTH 65536u
 struct gids_options {
-    const char *filename, *transport;
+    const char *filename, *transport, *traddr, *trsvcid, *subnqn, *hostnqn;
     const char *ap_latency, *ap_plan;
-    unsigned gpu, depth, max_bs, nsid, poll_budget, host_buffers;
+    unsigned gpu, depth, max_bs, nsid, timeout_ms, poll_budget, host_buffers;
 };
 struct gids_geometry {
     uint64_t capacity;

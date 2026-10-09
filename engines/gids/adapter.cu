@@ -111,9 +111,14 @@ static void snapshot_plan(gids *s) {
 extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo, char *err, size_t n) {
     *out=nullptr;
     try {
-        if (std::strcmp(o->transport,"pcie"))
-            throw std::runtime_error("transport must be pcie");
-        const unsigned limit=GIDS_PCIE_MAX_DEPTH;
+#if !GIDS_HAVE_MLX5
+        if (std::strcmp(o->transport,"rdma")==0)
+            throw std::runtime_error("RDMA is disabled; rebuild with GIDS_RDMA=mlx5");
+#endif
+        const bool pcie=std::strcmp(o->transport,"pcie")==0;
+        if (!pcie && std::strcmp(o->transport,"rdma"))
+            throw std::runtime_error("transport must be pcie or rdma");
+        const unsigned limit=pcie ? GIDS_PCIE_MAX_DEPTH : GIDS_RDMA_MAX_DEPTH;
         if (!o->depth || o->depth>limit || !o->max_bs || o->max_bs>16*1024*1024)
             throw std::runtime_error("iodepth must be 1.."+std::to_string(limit)+" and bs must be 1..16MiB");
         auto s=std::make_unique<gids>();
@@ -157,7 +162,11 @@ extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo
         fill_data<<<64,256,0,s->stream>>>((unsigned char *)s->data, s->stride*o->depth);
         gpu_check(cudaGetLastError(), "GPU fill launch");
         gpu_check(cudaStreamSynchronize(s->stream), "GPU fill completion");
+#if GIDS_HAVE_MLX5
+        s->backend=std::string(o->transport)=="pcie" ? make_pcie() : make_rdma();
+#else
         s->backend=make_pcie();
+#endif
         s->backend->open(*o, s->data, s->stride, s->geo);
         if (o->max_bs>s->geo.max_transfer)
             throw std::runtime_error("bs exceeds controller/PRP maximum transfer ("+std::to_string(s->geo.max_transfer)+" bytes)");

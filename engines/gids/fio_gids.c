@@ -10,17 +10,28 @@
 
 struct options {
     void *pad;
-    char *transport, *ap_latency, *ap_plan;
-    unsigned gpu, nsid, poll_budget, host_buffers;
+    char *transport, *traddr, *trsvcid, *subnqn, *hostnqn, *ap_latency, *ap_plan;
+    unsigned gpu, nsid, timeout_ms, poll_budget, host_buffers;
 };
 #define OPTSTR(key, member, desc, value) { .name=key, .lname=key, .type=FIO_OPT_STR_STORE, .off1=offsetof(struct options,member), .help=desc, .def=value, .category=FIO_OPT_C_ENGINE, .group=FIO_OPT_G_INVALID }
 #define OPTINT(key, member, desc, value, lo, hi) { .name=key, .lname=key, .type=FIO_OPT_INT, .off1=offsetof(struct options,member), .help=desc, .def=value, .minval=lo, .maxval=hi, .category=FIO_OPT_C_ENGINE, .group=FIO_OPT_G_INVALID }
 static struct fio_option options[] = {
-    OPTSTR("gids_transport", transport, "pcie (no host data bounce)", "pcie"),
+#if GIDS_HAVE_MLX5
+    OPTSTR("gids_transport", transport, "pcie or rdma (mlx5; no host data bounce)", "pcie"),
+    OPTSTR("gids_traddr", traddr, "NVMe/RDMA target IP address", NULL),
+    OPTSTR("gids_trsvcid", trsvcid, "NVMe/RDMA service port", "4420"),
+    OPTSTR("gids_subnqn", subnqn, "NVMe/RDMA subsystem NQN", NULL),
+    OPTSTR("gids_hostnqn", hostnqn, "Host NQN (default /etc/nvme/hostnqn)", NULL),
+#else
+    OPTSTR("gids_transport", transport, "pcie (RDMA disabled; rebuild with GIDS_RDMA=mlx5)", "pcie"),
+#endif
     OPTSTR("gids_ap_latency", ap_latency, "AP timestamp CSV (new file; QD1; fixed read or plan replay)", NULL),
     OPTSTR("gids_ap_plan", ap_plan, "Recorded random read/write plan; replay matching read_iolog", NULL),
     OPTINT("gids_gpu", gpu, "MetaX GPU ordinal", "0", 0, 1023),
     OPTINT("gids_nsid", nsid, "Namespace ID", "1", 1, 0x7fffffff),
+#if GIDS_HAVE_MLX5
+    OPTINT("gids_timeout_ms", timeout_ms, "RDMA connection and admin command timeout in milliseconds", "30000", 1, 3600000),
+#endif
     OPTINT("gids_poll_budget", poll_budget, "Bound on GPU CQ polling iterations", "1000000", 1, 0x7fffffff),
     OPTINT("gids_host_buffers", host_buffers, "Copy fio buffers for patterns/verification; adds H2D/D2H overhead", "0", 0, 1),
     { .name=NULL }
@@ -58,29 +69,48 @@ static int setup(struct thread_data *td)
         log_err("gids: requires thread=1, one namespace per job, iodepth>=1; trim, verify_async and ZBD are unsupported\n");
         return 1;
     }
-    unsigned limit = GIDS_PCIE_MAX_DEPTH;
+    if (strcmp(o->transport, "pcie") && strcmp(o->transport, "rdma")) {
+        log_err("gids: gids_transport must be pcie or rdma\n");
+        return 1;
+    }
+#if !GIDS_HAVE_MLX5
+    if (!strcmp(o->transport, "rdma")) {
+        log_err("gids: RDMA is disabled; rebuild with GIDS_RDMA=mlx5\n");
+        return 1;
+    }
+#endif
+    unsigned limit = !strcmp(o->transport, "pcie") ? GIDS_PCIE_MAX_DEPTH : GIDS_RDMA_MAX_DEPTH;
     if (td->o.iodepth > limit) {
         log_err("gids: %s requires iodepth<=%u\n", o->transport, limit);
         return 1;
     }
-    if (strcmp(o->transport, "pcie")) {
-        log_err("gids: gids_transport must be pcie\n");
+    if (!strcmp(o->transport, "rdma") && (!o->traddr || !o->subnqn)) {
+        log_err("gids: RDMA requires gids_traddr and gids_subnqn\n");
         return 1;
     }
     return 0;
 }
 static int file_size(struct thread_data *td, struct fio_file *f)
 {
+    struct options *o = td->eo;
     struct state *s = td->io_ops_data;
     uint64_t capacity;
     if (s) capacity = s->geo.capacity;
-    else {
+    else if (!strcmp(o->transport, "pcie")) {
         int fd = open(f->file_name, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return errno;
         int rc = ioctl(fd, BLKGETSIZE64, &capacity);
         int err = errno;
         close(fd);
         if (rc) return err;
+    } else {
+        /* setup_files can precede worker init. Identify checks the real size
+         * again in the worker before any I/O is submitted. */
+        if (!td->o.size || td->o.size == UINT64_MAX || td->o.start_offset > UINT64_MAX - td->o.size) {
+            log_err("gids: RDMA jobs require explicit size=\n");
+            return EINVAL;
+        }
+        capacity = td->o.start_offset + td->o.size;
     }
     f->real_file_size = capacity;
     fio_file_set_size_known(f);
@@ -101,9 +131,10 @@ static int init(struct thread_data *td)
     if (!s->ios || !s->events) return ENOMEM;
     struct gids_options opts = {
         .filename=td->files[0]->file_name, .transport=o->transport,
+        .traddr=o->traddr, .trsvcid=o->trsvcid, .subnqn=o->subnqn, .hostnqn=o->hostnqn,
         .ap_latency=o->ap_latency, .ap_plan=o->ap_plan,
         .gpu=o->gpu, .depth=td->o.iodepth, .max_bs=max_bs, .nsid=o->nsid,
-        .poll_budget=o->poll_budget,
+        .timeout_ms=o->timeout_ms, .poll_budget=o->poll_budget,
         .host_buffers=o->host_buffers || td->o.verify != VERIFY_NONE
     };
     s->batch.depth = td->o.iodepth;

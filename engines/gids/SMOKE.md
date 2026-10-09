@@ -77,13 +77,52 @@ If a run fails to restore the controller, preserve the logs and inspect
 outstanding I/O before attempting recovery. SIGKILL or a device/driver
 failure can prevent normal cleanup.
 
+## NVMe-oF/RDMA
+
+Build the plugin with `make -C engines/gids GIDS_RDMA=mlx5 -j8` as described
+in [BUILD.md](BUILD.md); the default build supports PCIe only.
+
+Use an existing test target with a known backing namespace. Confirm its
+identity, capacity and permitted read range with the target owner. The
+initiator needs an mlx5 NIC, working RDMA routing and a peer-memory driver
+that allows the NIC to register GPU memory. The target must accept the
+chosen host NQN. This test connects directly from the plugin and does not
+require a kernel NVMe-oF connection or local snvme modules.
+
+Set `TRADDR`, `TRSVCID`, `SUBNQN`, `HOSTNQN` and `NSID` from the target
+configuration. Use its IPv4 address and numeric port. Run once with
+`BS=4096`, then with `BS=131072`, using a new `LABEL` for each run:
+
+```bash
+: "${TRADDR:?set the target IPv4 address}"
+: "${TRSVCID:?set its RDMA port}"
+: "${SUBNQN:?set the subsystem NQN}"
+: "${HOSTNQN:?set an allowed host NQN}"
+: "${NSID:?set the namespace ID}"
+: "${BS:?set 4096 or 131072}"
+: "${LABEL:?set a unique result name}"
+export TRANSPORT=rdma
+./fio --readonly --name="$LABEL" --thread=1 \
+  --ioengine="$PWD/engines/gids/build/gids.so" \
+  --gids_transport=rdma --gids_gpu="$GPU" --filename=rdma \
+  --gids_traddr="$TRADDR" --gids_trsvcid="$TRSVCID" \
+  --gids_subnqn="$SUBNQN" --gids_hostnqn="$HOSTNQN" --gids_nsid="$NSID" \
+  --rw=read --bs="$BS" --size="$BS" --offset=1G --loops="$LOOPS" \
+  --iodepth=1 --gids_ap_latency="$OUT/$LABEL.csv" --eta=never \
+  --output-format=json --output="$OUT/$LABEL.json"
+```
+
+Require fio exit 0 and validate the result below. Confirm the test process
+has exited and the original target configuration and connections remain
+intact. No target reconfiguration is needed for this check.
+
 ## Check each result
 
 The following check uses Python's standard library and the recorded JSON
 and CSV files. It requires every sample, including warmup, to report a
 successful completion and full payload match. It also checks the GPU BDF,
 fixed offset, timestamp ordering and clock drift. Set `LABEL`, `BS` and
-`TRANSPORT=pcie` to match the run.
+`TRANSPORT=pcie` or `rdma` to match the run.
 
 ```bash
 export LABEL BS TRANSPORT
@@ -120,7 +159,10 @@ for index, row in enumerate(rows):
     assert row['offset'] == 1073741824
     assert row['status'] == row['mismatches'] == 0
     names = ['sq_begin', 'doorbell', 'cq_seen']
-    names += ['cqe_observed', 'slot_reclaimed']
+    if transport == 'pcie':
+        names += ['cqe_observed', 'slot_reclaimed']
+    else:
+        assert row['cqe_observed'] == row['slot_reclaimed'] == 0
     stamps = [row[name] for name in names + ['first_read', 'all_read']]
     assert all(value > 0 for value in stamps) and stamps == sorted(stamps)
 print(f'PASS: {count} verified {block}-byte reads on {transport}')

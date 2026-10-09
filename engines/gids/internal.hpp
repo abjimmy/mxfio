@@ -23,6 +23,9 @@ public:
     virtual void diagnose(unsigned) {}
 };
 std::unique_ptr<Backend> make_pcie();
+#if GIDS_HAVE_MLX5
+std::unique_ptr<Backend> make_rdma();
+#endif
 ApCalibration calibrate_ap_clock(cudaStream_t);
 cudaError_t launch_pcie_profile(void *,const void *,const Request *,Result *,
     void *,const void *,ApSample *,unsigned,cudaStream_t);
