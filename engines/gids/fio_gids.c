@@ -3,6 +3,7 @@
 #include "../../optgroup.h"
 #include "../../verify.h"
 #include "adapter.h"
+#include "pcie_config.h"
 #include <errno.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -12,6 +13,8 @@ struct options {
     void *pad;
     char *transport, *traddr, *trsvcid, *subnqn, *hostnqn, *ap_latency, *ap_plan;
     unsigned gpu, nsid, timeout_ms, poll_budget, host_buffers;
+    char *submit_mode;
+    unsigned qps, workers, qd, block_threads, buffer_seed;
 };
 #define OPTSTR(key, member, desc, value) { .name=key, .lname=key, .type=FIO_OPT_STR_STORE, .off1=offsetof(struct options,member), .help=desc, .def=value, .category=FIO_OPT_C_ENGINE, .group=FIO_OPT_G_INVALID }
 #define OPTINT(key, member, desc, value, lo, hi) { .name=key, .lname=key, .type=FIO_OPT_INT, .off1=offsetof(struct options,member), .help=desc, .def=value, .minval=lo, .maxval=hi, .category=FIO_OPT_C_ENGINE, .group=FIO_OPT_G_INVALID }
@@ -34,9 +37,15 @@ static struct fio_option options[] = {
 #endif
     OPTINT("gids_poll_budget", poll_budget, "Bound on GPU CQ polling iterations", "1000000", 1, 0x7fffffff),
     OPTINT("gids_host_buffers", host_buffers, "Copy fio buffers for patterns/verification; adds H2D/D2H overhead", "0", 0, 1),
+    OPTINT("gids_buffer_seed", buffer_seed, "Seed for the reusable GPU payload pool (host_buffers=0; no per-I/O refill)", "20261014", 0, 0x7fffffff),
+    OPTSTR("gids_submit_mode", submit_mode, "PCIe: batched queue owners or Tutti-style workers", "batched"),
+    OPTINT("gids_qps", qps, "PCIe SQ/CQ pairs per file per job", "1", 1, GIDS_PCIE_MAX_QPS),
+    OPTINT("gids_workers", workers, "PCIe workers mode: threads per job kernel (0=256, capped by iodepth)", "0", 0, 65536),
+    OPTINT("gids_qd", qd, "PCIe per-QP outstanding limit (0=hardware ring capacity minus one)", "0", 0, 65535),
+    OPTINT("gids_block_threads", block_threads, "PCIe threads per GPU block (0=32); total threads follow QPs/workers", "0", 0, 1024),
     { .name=NULL }
 };
-/* One adapter per fio job. A PCIe adapter owns one QP. Slots remain live
+/* One adapter/stream per fio job; PCIe can own several files and QPs. Slots remain live
  * until the whole GPU batch completes and fio consumes every event. */
 struct batch {
     struct gids *ctx;
@@ -54,6 +63,17 @@ struct state {
 static int setup(struct thread_data *td)
 {
     struct options *o = td->eo;
+    if (o->submit_mode && strcmp(o->submit_mode,"batched") && strcmp(o->submit_mode,"workers")) {
+        log_err("gids: gids_submit_mode must be batched or workers\n"); return 1;
+    }
+    struct gids_options parallel = {
+        .transport=o->transport, .ap_latency=o->ap_latency, .nr_files=td->o.nr_files,
+        .pcie_mode=o->submit_mode && !strcmp(o->submit_mode,"workers") ? GIDS_PCIE_WORKERS : GIDS_PCIE_BATCHED,
+        .pcie_qps=o->qps, .pcie_workers=o->workers, .pcie_qd=o->qd,
+        .pcie_block_threads=o->block_threads
+    };
+    const char *why=gids_parallel_config_error(&parallel);
+    if (why) { log_err("gids: %s\n",why); return 1; }
     if (o->ap_plan && !o->ap_latency) {
         log_err("gids: gids_ap_plan requires gids_ap_latency\n");
         return 1;
@@ -64,9 +84,9 @@ static int setup(struct thread_data *td)
         log_err("gids: AP latency requires QD1, rw=read (or write with a plan), verify=0, gids_host_buffers=0\n");
         return 1;
     }
-    if (!td->o.use_thread || td->o.nr_files != 1 || !td->o.iodepth ||
+    if (!td->o.use_thread || !td->o.nr_files || !td->o.iodepth ||
         td_trim(td) || td->o.verify_async || td->o.zone_mode == ZONE_MODE_ZBD) {
-        log_err("gids: requires thread=1, one namespace per job, iodepth>=1; trim, verify_async and ZBD are unsupported\n");
+        log_err("gids: requires thread=1, namespace files, iodepth>=1; trim, verify_async and ZBD are unsupported\n");
         return 1;
     }
     if (strcmp(o->transport, "pcie") && strcmp(o->transport, "rdma")) {
@@ -95,7 +115,12 @@ static int file_size(struct thread_data *td, struct fio_file *f)
     struct options *o = td->eo;
     struct state *s = td->io_ops_data;
     uint64_t capacity;
-    if (s) capacity = s->geo.capacity;
+    if (s) {
+        struct gids_geometry geo;
+        int rc=gids_file_geometry(s->batch.ctx,(unsigned)f->fileno,&geo);
+        if (rc) return rc;
+        capacity=geo.capacity;
+    }
     else if (!strcmp(o->transport, "pcie")) {
         int fd = open(f->file_name, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return errno;
@@ -129,17 +154,25 @@ static int init(struct thread_data *td)
     s->ios = calloc(td->o.iodepth, sizeof(*s->ios));
     s->events = calloc(td->o.iodepth, sizeof(*s->events));
     if (!s->ios || !s->events) return ENOMEM;
+    const char **names=calloc(td->o.nr_files,sizeof(*names));
+    if (!names) return ENOMEM;
+    for (unsigned i=0;i<td->o.nr_files;++i) names[i]=td->files[i]->file_name;
     struct gids_options opts = {
         .filename=td->files[0]->file_name, .transport=o->transport,
         .traddr=o->traddr, .trsvcid=o->trsvcid, .subnqn=o->subnqn, .hostnqn=o->hostnqn,
         .ap_latency=o->ap_latency, .ap_plan=o->ap_plan,
         .gpu=o->gpu, .depth=td->o.iodepth, .max_bs=max_bs, .nsid=o->nsid,
         .timeout_ms=o->timeout_ms, .poll_budget=o->poll_budget,
-        .host_buffers=o->host_buffers || td->o.verify != VERIFY_NONE
+        .host_buffers=o->host_buffers || td->o.verify != VERIFY_NONE,
+        .filenames=names, .nr_files=td->o.nr_files, .buffer_seed=o->buffer_seed,
+        .pcie_mode=o->submit_mode && !strcmp(o->submit_mode,"workers") ? GIDS_PCIE_WORKERS : GIDS_PCIE_BATCHED,
+        .pcie_qps=o->qps, .pcie_workers=o->workers, .pcie_qd=o->qd,
+        .pcie_block_threads=o->block_threads
     };
     s->batch.depth = td->o.iodepth;
     s->batch.ios = s->ios;
     rc = gids_create(&opts, &s->batch.ctx, &s->geo, error, sizeof(error));
+    free(names);
     if (rc) {
         log_err("gids: %s\n", error);
         return rc;
@@ -161,7 +194,8 @@ static enum fio_q_status queue(struct thread_data *td, struct io_u *io)
         io->error=EOPNOTSUPP;
         return FIO_Q_COMPLETED;
     }
-    rc = gids_prepare(b->ctx, b->pending, io->xfer_buf, io->offset, io->xfer_buflen, io->ddir == DDIR_WRITE);
+    rc = gids_prepare_file(b->ctx, io->file ? (unsigned)io->file->fileno : 0,
+                          b->pending, io->xfer_buf, io->offset, io->xfer_buflen, io->ddir == DDIR_WRITE);
     if (rc) { io->error=rc; return FIO_Q_COMPLETED; }
     b->ios[b->pending++] = io;
     return FIO_Q_QUEUED;

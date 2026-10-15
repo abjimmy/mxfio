@@ -11,6 +11,7 @@ static int test_nanosleep(const struct timespec *t, struct timespec *left)
 #undef nanosleep
 struct gids {
     unsigned depth, prepared, submitted, polls, ready_at;
+    unsigned files, last_file;
     int busy, submit_error, poll_error, result_error, prepare_error;
 };
 static unsigned created, destroyed, marked, stamped;
@@ -28,6 +29,7 @@ int gids_create(const struct gids_options *o, struct gids **out,
     (void)error; (void)len; ++created;
     if (fail_create) return ENOMEM;
     *out=calloc(1,sizeof(**out)); assert(*out); (*out)->depth=o->depth;
+    (*out)->files=o->nr_files;
     *geo=(struct gids_geometry){1ULL<<30,512,131072}; return 0;
 }
 int gids_prepare(struct gids *g, unsigned slot, void *host, uint64_t offset,
@@ -37,6 +39,16 @@ int gids_prepare(struct gids *g, unsigned slot, void *host, uint64_t offset,
     assert(!g->busy && slot < g->depth);
     if (g->prepare_error) return g->prepare_error;
     assert(slot == g->prepared++); return 0;
+}
+int gids_prepare_file(struct gids *g,unsigned file,unsigned slot,void *host,
+                      uint64_t offset,unsigned bytes,int write) {
+    if (file>=g->files) return EINVAL;
+    g->last_file=file;
+    return gids_prepare(g,slot,host,offset,bytes,write);
+}
+int gids_file_geometry(struct gids *g,unsigned file,struct gids_geometry *geo) {
+    if (file>=g->files) return EINVAL;
+    *geo=(struct gids_geometry){(uint64_t)(file+1)<<30,512,131072}; return 0;
 }
 int gids_submit(struct gids *g, unsigned count)
 {
@@ -143,8 +155,30 @@ static void limits_and_timestamps(void)
     assert(getevents(&td,1,1,NULL) == 1 && stamped == 1);
     assert(td.last_issue.tv_sec == 123); finish();
 }
+static void multiple_files(void)
+{
+    start(8); finish();
+    struct fio_file second={.file_name="/dev/mock1",.fileno=1};
+    struct fio_file *many[]={&file,&second};
+    td.files=many; td.o.nr_files=2;
+    opts.submit_mode="workers"; opts.qps=32; opts.workers=256;
+    assert(!setup(&td) && !init(&td));
+    struct state *s=td.io_ops_data;
+    assert(s->batch.ctx->files==2);
+    assert(!file_size(&td,&second) && second.real_file_size==(2ULL<<30));
+    ios[0].file=&file; ios[1].file=&second;
+    put(0,1); assert(s->batch.ctx->last_file==0);
+    put(1,1); assert(s->batch.ctx->last_file==1);
+    s->batch.ctx->ready_at=1;
+    assert(getevents(&td,2,8,NULL)==2); check_events(0,2,0);
+    opts.ap_latency="ap.csv"; assert(setup(&td)); opts.ap_latency=NULL;
+    opts.transport="rdma"; assert(setup(&td)); opts.transport="pcie";
+    opts.submit_mode="batched"; assert(setup(&td)); opts.workers=0;
+    opts.submit_mode="invalid"; assert(setup(&td));
+    cleanup(&td); assert(!td.io_ops_data); td.files=files;
+}
 int main(void)
 {
-    depths_and_partial_events(); failures(); limits_and_timestamps();
+    depths_and_partial_events(); failures(); limits_and_timestamps(); multiple_files();
     puts("scheduler callbacks: PASS"); return 0;
 }

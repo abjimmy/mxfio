@@ -1,6 +1,6 @@
 # Build and validate the external GiDS engine
 
-Use a Linux checkout, GCC/G++, make, Python 3, MACA 3.9.0 or later with
+Use a Linux checkout, GCC/G++, make, Python 3, MACA 3.9.0.18 or later with
 cu-bridge, and matching runtime/driver libraries. Rebuild with the required
 SDK for the target GPU architecture; upgrading only the runtime is insufficient.
 The default `GIDS_RDMA=off` build supports PCIe

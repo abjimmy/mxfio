@@ -41,7 +41,7 @@ $(GIDS_CONFIG): FORCE
 	@printf '#define GIDS_HAVE_MLX5 %s\n' '$(GIDS_HAVE_MLX5)' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
 FORCE:
-$(BUILD)/fio_gids.o: fio_gids.c adapter.h $(FIO_ROOT)/config-host.h
+$(BUILD)/fio_gids.o: fio_gids.c adapter.h pcie_config.h $(FIO_ROOT)/config-host.h
 	@mkdir -p $(@D)
 	$(CC) $(GIDS_CPPFLAGS) -O2 -g -Wall -Wextra -Wno-unused-parameter -fPIC -D_GNU_SOURCE -DFIO_INTERNAL -I$(FIO_ROOT) -include $(FIO_ROOT)/config-host.h -c $< -o $@
 $(BUILD)/%.o: %.cpp
@@ -68,6 +68,10 @@ test:
 	$(BUILD)/scheduler_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/pcie_batch_test.cpp -o $(BUILD)/pcie_batch_test
 	$(BUILD)/pcie_batch_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/pcie_plan_test.cpp -o $(BUILD)/pcie_plan_test
+	$(BUILD)/pcie_plan_test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread tests/worker_pool_test.cpp -o $(BUILD)/worker_pool_test
+	$(BUILD)/worker_pool_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/rdma_batch_test.cpp -o $(BUILD)/rdma_batch_test
 	$(BUILD)/rdma_batch_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/wire_test.cpp -o $(BUILD)/wire_test

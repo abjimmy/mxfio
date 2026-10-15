@@ -1,6 +1,6 @@
 # 独立部署准备
 
-GiDS 是外部 fio ioengine；仅需本仓库、MACA 3.9.0 或更新版本和所选传输的系统依赖。
+GiDS 是外部 fio ioengine；仅需本仓库、MACA 3.9.0.18 或更新版本和所选传输的系统依赖。
 须使用对应 SDK 为目标 GPU 重新编译，并加载匹配的运行库。
 默认构建仅支持 PCIe，不依赖 RDMA 库；需要 RDMA 时按 [BUILD.md](BUILD.md)
 使用 `GIDS_RDMA=mlx5` 并安装对应开发库。
@@ -70,7 +70,7 @@ set -o pipefail
 /srv/tutti/config/gpu-probe "$GPU_BDF" | tee /srv/tutti/logs/gpu-map.log
 ```
 
-`MACA_PATH` 应指向选定的 MACA 3.9.0 或更新 SDK。确认 `cucc --version` 的
+`MACA_PATH` 应指向选定的 MACA 3.9.0.18 或更新 SDK。确认 `cucc --version` 的
 `InstalledDir` 属于该 SDK：容器可能预设旧的 `MACA_CLANG_PATH` 或 `MXCC_PATH`，
 仅改 `MACA_PATH` 不足以切换实际编译器。更换 SDK 后使用新的 `BUILD` 目录重编译。
 

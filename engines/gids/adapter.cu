@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include "internal.hpp"
 #include "ap_plan.hpp"
+#include "pcie_config.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -59,8 +60,13 @@ struct gids {
         if (staging) cudaFreeHost(staging);
     }
 };
-__global__ static void fill_data(unsigned char *p, size_t n) {
-    for (size_t i=blockIdx.x*blockDim.x+threadIdx.x; i<n; i+=blockDim.x*gridDim.x) p[i]=(unsigned char)(i*17+0x5a);
+__global__ static void fill_data(uint64_t *p, size_t words, uint64_t seed) {
+    for (size_t i=blockIdx.x*blockDim.x+threadIdx.x; i<words; i+=blockDim.x*gridDim.x) {
+        uint64_t x=seed ^ (uint64_t(i)*0x9e3779b97f4a7c15ull);
+        x=(x^(x>>30))*0xbf58476d1ce4e5b9ull;
+        x=(x^(x>>27))*0x94d049bb133111ebull;
+        p[i]=x^(x>>31);
+    }
     __threadfence_system();
 }
 __global__ static void write_reference(uint64_t *reference,unsigned words,
@@ -111,6 +117,12 @@ static void snapshot_plan(gids *s) {
 extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo, char *err, size_t n) {
     *out=nullptr;
     try {
+        if (const char *why=gids_parallel_config_error(o)) throw std::runtime_error(why);
+        if (o->nr_files) {
+            if (!o->filenames) throw std::runtime_error("missing namespace list");
+            for (unsigned i=0;i<o->nr_files;++i)
+                if (!o->filenames[i] || !*o->filenames[i]) throw std::runtime_error("empty namespace filename");
+        }
 #if !GIDS_HAVE_MLX5
         if (std::strcmp(o->transport,"rdma")==0)
             throw std::runtime_error("RDMA is disabled; rebuild with GIDS_RDMA=mlx5");
@@ -159,7 +171,7 @@ extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo
                 s->plan.offsets.size(),(unsigned long long)s->plan.seed,ref_bytes,unsigned(s->plan.write));
             std::fprintf(s->ap_file,"sample,offset,bytes,status,sq_begin,doorbell,cq_seen,cqe_observed,slot_reclaimed,first_read,all_read,mismatches,ap_done\n");
         }
-        fill_data<<<64,256,0,s->stream>>>((unsigned char *)s->data, s->stride*o->depth);
+        fill_data<<<64,256,0,s->stream>>>((uint64_t *)s->data, s->stride*o->depth/8, o->buffer_seed);
         gpu_check(cudaGetLastError(), "GPU fill launch");
         gpu_check(cudaStreamSynchronize(s->stream), "GPU fill completion");
 #if GIDS_HAVE_MLX5
@@ -168,6 +180,7 @@ extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo
         s->backend=make_pcie();
 #endif
         s->backend->open(*o, s->data, s->stride, s->geo);
+        s->opt.filenames=nullptr; // borrowed only during open; backend owns routing.
         if (o->max_bs>s->geo.max_transfer)
             throw std::runtime_error("bs exceeds controller/PRP maximum transfer ("+std::to_string(s->geo.max_transfer)+" bytes)");
         if(o->ap_plan) {
@@ -180,9 +193,23 @@ extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo
     } catch (const std::exception &e) { std::snprintf(err,n,"%s",e.what()); return EIO; }
 }
 extern "C" int gids_prepare(gids *s, unsigned slot, void *host, uint64_t offset, unsigned bytes, int write) {
+    return gids_prepare_file(s,0,slot,host,offset,bytes,write);
+}
+extern "C" int gids_file_geometry(gids *s,unsigned file,gids_geometry *out) {
+    if (file>=(s->opt.nr_files ? s->opt.nr_files : 1)) return EINVAL;
+    try {
+        *out=file ? s->backend->file_geometry(file) : s->geo;
+        return 0;
+    } catch (const std::exception &e) { s->error=e.what(); return EIO; }
+}
+extern "C" int gids_prepare_file(gids *s,unsigned file,unsigned slot,void *host,
+                                 uint64_t offset,unsigned bytes,int write) {
     if (s->poisoned) return EIO;
-    if (slot>=s->opt.depth || !bytes || bytes>s->opt.max_bs || bytes%s->geo.block_size ||
-        offset%s->geo.block_size || offset>s->geo.capacity || bytes>s->geo.capacity-offset) return EINVAL;
+    gids_geometry geo{};
+    int rc=gids_file_geometry(s,file,&geo);
+    if (rc) return rc;
+    if (slot>=s->opt.depth || !bytes || bytes>s->opt.max_bs || bytes>geo.max_transfer || bytes%geo.block_size ||
+        offset%geo.block_size || offset>geo.capacity || bytes>geo.capacity-offset) return EINVAL;
     try {
         if (s->ap_file) {
             if(bytes%8) return EINVAL;
@@ -203,7 +230,7 @@ extern "C" int gids_prepare(gids *s, unsigned slot, void *host, uint64_t offset,
         s->requests[slot]={offset,bytes,unsigned(write)};
         s->hosts[slot]=host;
         if (s->staging && write) std::memcpy(s->staging+slot*s->stride,host,bytes);
-        s->backend->prepare(slot,s->requests[slot]);
+        s->backend->prepare_file(file,slot,s->requests[slot]);
         return 0;
     } catch (const std::exception &e) { s->error=e.what(); return EIO; }
 }

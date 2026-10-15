@@ -9,7 +9,7 @@ GiDS 测试无需模型、torch/vLLM 或 Tutti Python 包，本地测试盘无�
 
 插件独立构建为 `gids.so`，由 fio 动态加载；未加入 fio 主程序的引擎编译清单，也未修改其 ioengine ABI。必须针对要运行的 fio 版本及其 `config-host.h` 重新构建。
 
-可选 Tutti Runtime 后端的扩展计划见 [TODO](TODO.md)，包括多盘融合提交、worker 配置、层流水线和计算干扰测试；这些能力尚未实现。
+设计目标是让 fio 通过参数扫描测量 GiDS 驱动 SSD 的性能上限，Tutti 的 I/O 提交方式是其中一种配置。单 job 多盘、多 QP、GPU worker 的参数与验收边界见 [并行 I/O](PARALLEL_IO.md)。层流水线、轨迹回放及可选 Runtime 接入见 [TODO](TODO.md)；不能将源码实现或离线测试记作硬件性能验收。
 
 建议顺序：编译并通过 `make -C engines/gids test` → 核对空闲 GPU 的可见编号/BDF → 验收所需的 PCIe 或 RDMA 路径。PCIe fio 会接管整个 NVMe 控制器，必须在同盘 daemon 已退出、文件系统卸载、其他使用者释放后运行。不要同时让两套程序接管同盘。
 
@@ -22,12 +22,12 @@ job、独立 CSV 和逐 job 结果检查；包含参数化 fio 配置及扩展�
 
 ## 数据通路
 
-* **pcie**：CPU 建立控制器、队列及 PRP 映射，每个 fio job 独占一个 NVMe QP。GPU 批次 kernel 复用 Tutti 的 SQ/CQ 原语，先提交多条命令，再按 CQ 到达顺序和 CID 回收结果；SSD DMA 直接访问 GPU 显存。
+* **pcie**：CPU 建立控制器、队列及 PRP 映射，每个 fio job 可打开多个 namespace，每盘独占 `gids_qps` 个 SQ/CQ。一个 stream 的一次 kernel 提交可以覆盖所有盘；可选每队列一个 GPU 线程批量推进，或多个 GPU worker 共享队列。默认单盘、单 QP 继续使用原批量路径。SSD DMA 直接访问 GPU 显存。
 * **rdma**：CPU 用 RDMA CM/verbs 完成连接、Fabrics Connect、Identify 和显存 MR 注册。每个 fio job 使用一个数据 RC QP，以及独立的管理连接。GPU 构造多条 NVMe keyed-SGL 命令、发布 mlx5 RQ/SQ、写 NIC UAR 门铃并轮询 CQ；按 CID 匹配响应，等待 SEND 与响应接收均完成后回收请求。目标端通过 RDMA READ/WRITE 直接访问 GPU 显存。每次数据 I/O 没有 CPU `ibv_post_send`/`ibv_poll_cq` 代理，没有 TCP 或主机数据中转回退。
 
 CPU 仍负责 fio 调度、批次 kernel launch 和状态回收。RDMA 队列页映射给 GPU，命令、响应及数据缓冲区位于 GPU 显存；显式关闭 CQE scatter，避免响应内联到主机 CQ。共享 UAR 使用独立 warp 发布门铃，避免同一 warp 的存储合并丢失门铃。相邻主机页在 MACA 上可能映射到不连续 GPU 地址，因此 SQ/RQ/CQ 按页寻址。
 
-使用 **MACA 3.9.0 或更新版本编译并运行**，并对目标 GPU 架构重新构建；只更换运行库不够。GiDS 使用原始 `cudaMalloc` 分配，不包含旧版 SDK 的 SQ/CQ 可见性 workaround。MACA 3.7.0 和 3.8.2 不在支持范围内。
+使用 **MACA 3.9.0.18 或更新版本编译并运行**，并对目标 GPU 架构重新构建；只更换运行库不够。GiDS 使用原始 `cudaMalloc` 分配，不包含旧版 SDK 的 SQ/CQ 可见性 workaround。MACA 3.7.0 和 3.8.2 不在支持范围内。
 
 默认 `gids_host_buffers=0`：写数据在 GPU 初始化，读数据留在 GPU，仅请求和完成状态经过 CPU。fio 的 buffer_pattern、refill_buffers 等主机缓冲区设置此时不控制实际写数据。启用 `verify=crc32c` 等 fio 校验或显式设置 `gids_host_buffers=1` 时，会在存储传输之前/之后额外复制 fio 校验数据 H2D/D2H；存储传输仍直接访问显存，但测试时间包含这些复制，不能作为纯 GiDS 性能结果。
 
@@ -149,10 +149,15 @@ RDMA 监听地址、端口、NQN 和 host ACL 必须按实际目标配置填写�
 | gids_timeout_ms | 30000 | RDMA 建连与管理命令的毫秒超时 |
 | gids_poll_budget | 1000000 | GPU 无进展轮询的迭代上限；不是毫秒。批次每次成功提交或处理完成记录都会重置计数；QD1 AP 按单请求计数 |
 | gids_host_buffers | 0 | 复制 fio 缓冲区供校验/指定写模式；verify 自动启用 |
+| gids_submit_mode | batched | PCIe：batched 每个活跃 QP 一个线程批量推进；workers 多线程复用 Tutti 共享 QP 原语 |
+| gids_qps | 1 | PCIe 每文件、每 job 的 SQ/CQ 对数，1..32；实际控制器配额不足时报错 |
+| gids_workers | 0 | 仅 workers 模式：整个 job 的 worker 数；0 表示 256，受 iodepth 和本批请求数限制 |
+| gids_qd | 0 | PCIe 每 QP 在途上限；0 使用硬件 ring_entries−1，受 iodepth 限制；workers 模式还有静态容量检查 |
+| gids_block_threads | 0 | PCIe 每 block 线程数；0 表示 32，实际不超过本批工作线程数；显式值须满足 GPU 限制 |
 | gids_ap_latency | 无 | 新 CSV 路径；启用 QD1 AP 计时及显存校验，默认固定块只读 |
 | gids_ap_plan | 无 | 随机读写地址计划；与 `gids_ap_latency`、匹配的 fio `read_iolog` 一起使用，详见 [RANDOM_LATENCY.md](RANDOM_LATENCY.md) |
 
-* 必须 `thread=1`，每 job 一个 namespace。PCIe 每 job 一个 QP、一个 stream；`numjobs` 增加独立 job/QP，`iodepth=1..65536` 控制每个 job 的请求上限，65536 来自批次中使用的 16 位 CID 空间。硬件环大小由控制器/驱动确定，初始化日志给出 `ring_entries` 和 `outstanding_limit=min(iodepth, ring_entries-1)`；超过环容量的批次在 GPU 内分段推进。实际可用 QP 数、显存和映射资源也限制配置规模。
+* 必须 `thread=1`。PCIe 可以用冒号分隔的 `filename` 列表在同一 job 打开多个 namespace，每 job 一个 stream、每文件 `gids_qps` 个 QP。`numjobs` 增加独立 job/stream/队列组；`iodepth=1..65536` 是每 job 跨所有盘的请求上限。硬件环大小由控制器/驱动确定，日志给出 `ring_entries` 和每 QP 的 `outstanding_limit`；超过在途窗口的 batched 批次分段推进。实际 QP 配额、显存和 DMA 映射资源也限制配置规模。
 * RDMA 同样每 job 一个数据 QP、`iodepth=1..65536`。物理在途窗口受 target、NIC 和 GPU 队列页表容量限制，当前最多 256 个请求；更大的 fio 批次在同一 QP 内分段推进。初始化日志打印实际 SQ/RQ/CQ 容量和 `outstanding_limit`，不因提高 `iodepth` 而创建更多 QP。
 * 每个 job 只允许一个在途批次，整批完成并被 fio 回收后才复用缓冲区。多个 job 可独立推进。这个完成模型不同于逐请求完成后立即从 fio 补入新请求的模型。
 * fio `slat` 结束于主机提交函数返回，`clat` 覆盖其后的 GPU 工作及主机观察到完成的时间；两者都不是 GPU 内部 SQ→CQ 时间。设备内部时间使用 QD1 AP 测量。吞吐/延迟包含 fio 调度、kernel launch 和完成回收开销。
@@ -176,7 +181,15 @@ iodepth_batch_complete_max=128
 测吞吐时将两者设为相同值。`iodepth_batch_complete_min/max` 只控制 fio 一次取回
 多少个完成，不能提前取回尚未结束的 GPU 批次。比较时同时记录这些参数。
 
-## 单 GPU 多 QP / 多 SSD
+## 单 GPU、单 stream、多 QP / 多 SSD
+
+使用 [examples/pcie-parallel.fio](examples/pcie-parallel.fio) 可在一个 job 内打开多盘。
+`gids_submit_mode=workers`、`gids_workers=256`、`gids_qps=32`、
+`gids_block_threads=32` 表达 Tutti 常见的 worker/QP 调度形态；它并不重放 KV 层依赖。
+`batched` 则允许每个队列线程保有多条在途命令。具体配置、在途上限计算及调参顺序见
+[PARALLEL_IO.md](PARALLEL_IO.md)。
+
+### 保留的多 job 对照方式
 
 同一 SSD 上设置 `numjobs=4`，得到 4 个独立 job/QP；所有 job 指定相同的 `gids_gpu`。
 多 SSD 则使用独立 job 段，每段一个 `filename`。例如下面是同一 GPU、两块 SSD、
@@ -208,7 +221,7 @@ filename=${GIDS_NS1}
 用 `fio --readonly --output-format=json JOB.fio` 运行，逐 job 检查结果和时间重叠。
 这表示 4 个 QP、合计最多 512 个 fio 请求；有效硬件在途上限按各 job 的初始化日志
 求和。各 job 使用独立 stream/kernel，不是一个 kernel 跨盘融合提交，也不包含
-Tutti Runtime 的 worker 池、逐层 event 或 GPU 计算负载，相关扩展见 [TODO](TODO.md)。
+Tutti 的逐层 event 或 GPU 计算负载。这种独立 job 方式可与上述单 job 跨盘方式对照。
 一块盘的多个并发 job 必须在同一 fio 进程内，不能用多个独立 fio 进程同时接管它。
 
 调度回归与设备验收方法见 [TESTING.md](TESTING.md)。

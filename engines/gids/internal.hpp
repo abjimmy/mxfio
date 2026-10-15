@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include "profile_types.h"
+#include "pcie_plan.hpp"
 
 inline void gpu_check(cudaError_t e, const char *what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what)+": "+cudaGetErrorString(e));
@@ -18,6 +19,13 @@ public:
     virtual ~Backend() = default;
     virtual void open(const gids_options &, void *, size_t, gids_geometry &) = 0;
     virtual void prepare(unsigned, const Request &) = 0;
+    virtual void prepare_file(unsigned file, unsigned slot, const Request &r) {
+        if (file) throw std::runtime_error("backend does not support multiple files");
+        prepare(slot,r);
+    }
+    virtual gids_geometry file_geometry(unsigned) const {
+        throw std::runtime_error("backend does not support multiple files");
+    }
     virtual void launch(unsigned, const Request *, Result *, cudaStream_t) = 0;
     virtual void profile(const Request *,Result *,void *,const void *,ApSample *,cudaStream_t) = 0;
     virtual void diagnose(unsigned) {}
@@ -31,3 +39,13 @@ cudaError_t launch_pcie_profile(void *,const void *,const Request *,Result *,
     void *,const void *,ApSample *,unsigned,cudaStream_t);
 cudaError_t launch_pcie_batch(const void *, const void *, const Request *,
                              Result *, unsigned, unsigned, unsigned, cudaStream_t);
+struct PcieLaunch {
+    const void *targets, *descriptors;
+    const Request *requests;
+    Result *results;
+    const unsigned *devices, *indices;
+    const PcieRange *ranges;
+    unsigned count, range_count, workers, budget, block_threads;
+    unsigned *cursor;
+};
+cudaError_t launch_pcie_parallel(const PcieLaunch &, cudaStream_t);

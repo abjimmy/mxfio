@@ -1,13 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include "internal.hpp"
 #include "batch_pump.hpp"
+#include "worker_pool.hpp"
 #include "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh"
 #include "csrc/data_paths/local_nvme/io/prp_builder.h"
 
 namespace tnv = tutti::data_paths::local_nvme;
 
 namespace {
-/* Exactly one GPU lane owns this job's SQ and CQ. Stage SQEs before ringing
+/* Exactly one GPU lane owns each SQ and CQ. Stage SQEs before ringing
  * the doorbell, and reclaim a run of CQEs with one CQ doorbell. Tutti's
  * multi-producer locks are unnecessary for this exclusive owner. Keep its
  * ticket counters consistent so a drained QP can also run the QD1 profiler. */
@@ -19,6 +20,12 @@ struct Batch {
     QueuePair *qp;
     unsigned count;
     unsigned sq_head, sq_tail, cq_head, published_tail, published_head;
+    const unsigned *indices;
+    unsigned first;
+
+    __device__ unsigned global_slot(unsigned local) const {
+        return indices ? indices[first+local] : local;
+    }
 
     __device__ void flush_completions() {
         if (published_head == cq_head) return;
@@ -46,8 +53,8 @@ struct Batch {
     }
 
     __device__ bool submit(unsigned slot) {
-        const auto &r = requests[slot];
-        const auto &d = descriptors[slot];
+        const auto &r = requests[global_slot(slot)];
+        const auto &d = descriptors[global_slot(slot)];
         uint64_t lba = 0, blocks = 0;
         if (!tnv::resolve_lba(target, r.offset, d.data_length,
                              &lba, &blocks, 0)) return false;
@@ -79,7 +86,7 @@ struct Batch {
         if (((raw >> 16) & 1) != phase) { flush_completions(); return 0; }
         __threadfence_system();
         const unsigned slot = raw & 0xffff;
-        if (slot >= issued || results[slot].result != UINT32_MAX) return -1;
+        if (slot >= issued || results[global_slot(slot)].result != UINT32_MAX) return -1;
         const unsigned device_head = cq[pos].dword[2] & 0xffff;
         if (device_head > qp->sq.qs_minus_1) return -1;
         const unsigned retired = (device_head - sq_head) & qp->sq.qs_minus_1;
@@ -90,7 +97,7 @@ struct Batch {
                                             cuda::memory_order_relaxed);
         }
         ++cq_head;
-        results[slot] = { unsigned((raw >> 17) ? 3 : 0), raw };
+        results[global_slot(slot)] = { unsigned((raw >> 17) ? 3 : 0), raw };
         return 1;
     }
 
@@ -98,7 +105,8 @@ struct Batch {
     __device__ void finish() { flush_completions(); __threadfence_system(); }
     __device__ void fail(unsigned error) {
         for (unsigned i = 0; i < count; ++i)
-            if (results[i].result == UINT32_MAX) results[i] = { error, 0 };
+            if (results[global_slot(i)].result == UINT32_MAX)
+                results[global_slot(i)] = { error, 0 };
         __threadfence_system();
     }
 };
@@ -113,8 +121,61 @@ __global__ void pcie_batch(const tnv::DeviceTargetHandle *target,
     const unsigned sq_tail = qp->sq.tail.load(cuda::memory_order_relaxed);
     const unsigned cq_head = qp->cq.head.load(cuda::memory_order_relaxed);
     Batch batch{ target, descriptors, requests, results, qp, count,
-                 sq_head, sq_tail, cq_head, sq_tail, cq_head };
+                 sq_head, sq_tail, cq_head, sq_tail, cq_head, nullptr, 0 };
     gids_pump_batch(batch, count, window, budget);
+}
+
+/* Queue owners from every SSD run in ONE kernel on ONE job stream. The
+ * host partitions fio slots; each owner exclusively pumps its SQ/CQ. */
+__global__ void pcie_parallel_batch(PcieLaunch p) {
+    unsigned tid=blockIdx.x*blockDim.x+threadIdx.x;
+    if (tid>=p.range_count) return;
+    const auto r=p.ranges[tid];
+    const auto *table=static_cast<const tnv::DeviceTargetHandle *const *>(p.targets);
+    const auto *target=table[r.device];
+    auto *qp=target->d_qps+r.queue;
+    unsigned head=qp->sq.head.load(cuda::memory_order_acquire);
+    unsigned tail=qp->sq.tail.load(cuda::memory_order_relaxed);
+    unsigned cq=qp->cq.head.load(cuda::memory_order_relaxed);
+    Batch b{target,static_cast<const tnv::AddressDescriptor *>(p.descriptors),
+            p.requests,p.results,qp,r.count,head,tail,cq,tail,cq,p.indices,r.first};
+    gids_pump_batch(b,r.count,r.window,p.budget);
+}
+
+/* Tutti's one synchronous command per worker, dynamic task cursor and
+ * global-thread-index QP mapping. Shared QPs use the original Tutti
+ * submission/completion primitives, not the exclusive-owner pump. */
+struct PcieWorker {
+    PcieLaunch p;
+    const tnv::DeviceTargetHandle *const *table;
+    const tnv::AddressDescriptor *desc;
+    __device__ unsigned take() { return atomicAdd(p.cursor,1u); }
+    __device__ bool aborted() { return atomicAdd(p.cursor+1,0u)!=0; }
+    __device__ void abort() { atomicExch(p.cursor+1,1u); }
+    __device__ void cancel(unsigned slot) { p.results[slot]={4,0}; }
+    __device__ void reset() {
+        atomicExch(p.cursor+1,0u);
+        atomicExch(p.cursor,0u);
+    }
+    __device__ bool execute(unsigned slot) {
+        const auto &r=p.requests[slot];
+        const auto &d=desc[slot];
+        const auto *target=table[p.devices[slot]];
+        tnv::EntryCompletionStatus status{};
+        if (r.write)
+            tnv::submit_write_one(target,d.prp1,d.prp2,r.offset,d.data_length,&status,p.budget,0);
+        else
+            tnv::submit_read_one(target,d.prp1,d.prp2,r.offset,d.data_length,&status,p.budget,0);
+        p.results[slot]={status.result,status.nvme_status_dword3};
+        return status.result==0;
+    }
+};
+__global__ void pcie_workers(PcieLaunch p) {
+    unsigned tid=blockIdx.x*blockDim.x+threadIdx.x;
+    if (tid>=p.workers) return;
+    PcieWorker worker{p,static_cast<const tnv::DeviceTargetHandle *const *>(p.targets),
+                        static_cast<const tnv::AddressDescriptor *>(p.descriptors)};
+    gids_run_worker(worker,p.count,p.workers);
 }
 }
 
@@ -127,5 +188,18 @@ cudaError_t launch_pcie_batch(const void *target, const void *descriptors,
         static_cast<const tnv::DeviceTargetHandle *>(target),
         static_cast<const tnv::AddressDescriptor *>(descriptors), requests, results,
         count, window, budget);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_pcie_parallel(const PcieLaunch &p,cudaStream_t stream) {
+    if (!p.count || (!p.workers && !p.range_count) || !p.block_threads) return cudaErrorInvalidValue;
+    const unsigned block=p.block_threads;
+    if (p.workers) {
+        unsigned threads=p.workers<block ? p.workers : block;
+        pcie_workers<<<(p.workers+threads-1)/threads,threads,0,stream>>>(p);
+    } else {
+        unsigned threads=p.range_count<block ? p.range_count : block;
+        pcie_parallel_batch<<<(p.range_count+threads-1)/threads,threads,0,stream>>>(p);
+    }
     return cudaGetLastError();
 }

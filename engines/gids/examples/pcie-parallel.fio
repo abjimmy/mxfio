@@ -1,0 +1,28 @@
+; One GPU, one stream, multiple SSDs. Set the three environment variables
+; only after checking the actual GPU and exclusive namespace ownership.
+; Read-only range per SSD: [1 GiB, 2 GiB). See ../PARALLEL_IO.md.
+[global]
+ioengine=${GIDS_ENGINE}
+thread=1
+gids_transport=pcie
+gids_gpu=${GIDS_GPU}
+gids_submit_mode=workers
+gids_qps=32
+gids_workers=256
+gids_qd=0
+gids_block_threads=32
+rw=randread
+bs=128k
+offset=1g
+filesize=2g
+file_service_type=roundrobin
+iodepth=2048
+iodepth_batch_submit=2048
+iodepth_batch_complete_min=1
+iodepth_batch_complete_max=2048
+numjobs=1
+time_based=1
+runtime=30
+
+[parallel]
+filename=${GIDS_NAMESPACES}
