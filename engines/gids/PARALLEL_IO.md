@@ -17,6 +17,34 @@ GPU0 / NUMA0、Solidigm 三块 Gen5×4 加一块 Gen4×4，51 组只读测试；
 
 两种模式的 128 KiB 与 4 KiB 读回校验各通过 765 请求，覆盖多盘、重复及部分批次；51 组 fio 数据 I/O 均无报错。但主扫描结束时 Solidigm A 新增一条 SQ0 `DATA_XFER_ERROR` 管理命令错误，具体来源尚未定位，原恢复守卫失败记录保留。核对并恢复后，后续每组检查 SMART，错误计数未再增加；媒体错误、写入计数、unsafe_shutdowns 未增加，未见新的 kernel I/O/GPU/AER 故障。最终恢复原始驱动绑定状态且无遗留 GPU 测试进程；不能把本轮记作全项无异常的硬件验收。
 
+## 143 完成回传对照
+
+2026-10-15 在 C500 GPU0、MACA 3.9.0.18、ACS 重定向关闭的条件下，对比
+相同并行 I/O 实现的两种最终 D2H 提交时机。A/B 为 Gen5×4 SSD，D 为 Gen4×4；
+每盘一个 job，128 KiB randread，iodepth/job=1024、每盘 8 QP、gids_qd=32、
+block_threads=1、iodepth_batch_submit=1024、gids_host_buffers=0。
+每组 20 秒测量加 5 秒预热，两个版本各重复三次。以下是各 job 共同测量窗口
+的吞吐中位数，单位为十进制 GB/s；带追踪的两次运行不计入性能中位数。
+
+| 盘组 | 提前排入最终 D2H | kernel 完成后排入 D2H | 中位数提升 |
+|---|---:|---:|---:|
+| AD | 18.24 | 19.98 | 9.5% |
+| ABD | 21.64 | 32.76 | 51.4% |
+
+旧版 ABD 三次为 21.39–27.68 GB/s，新版为 32.75–32.76 GB/s；51.4% 是
+这组测试的中位数变化，不是固定收益。另一次新版四盘 ABCD 测得 41.09 GB/s，
+只有单次结果，没有同条件旧版四盘对照，不能计算四盘提升比例。
+
+时间线中快 job 的单批 kernel 平均仍约 9.5 ms，但相邻批次 kernel 启动间隔
+由约 18.96 ms 降至 10.62 ms。D2H activity 平均由约 8.45 ms 降至 0.003 ms；
+该 activity 包含依赖等待，不能解释为实际复制带宽提升几千倍。
+收益来自减少完成回收等待并更早提交下一批，批次内部 SQ/CQ 调度没有改变。
+单 job 仍整批回收，未实现逐请求补充新批次、持久 kernel 或计算重叠。
+
+这批结果的源码、构建、功能与设备恢复记录保存在 SICTS 工程
+`results/engines-143-plan-20261014/completion-fix-report.html`，原始数据单独归档。
+只读功能覆盖及尚未验证的路径见 [TESTING.md](TESTING.md#当前实现的验证范围)。
+
 ## 参数的独立含义
 
 | 资源 | 参数 | 作用范围 |
@@ -108,7 +136,7 @@ export GIDS_NAMESPACES='/dev/REPLACE_NS0:/dev/REPLACE_NS1'
 6. 与 Tutti 对照时固定同硬件、同请求大小和分盘分布、同 QP/worker 资源，区分设备 I/O 与 KV/E2E 时间。若相同负载下 fio 最佳结果仍显著低于 Tutti，应继续定位 fio/adapter 的提交或回收限制；不能把该 fio 结果发布为 GiDS 性能上限。
 
 “最大性能”的验收口径是指定硬件及负载下，扩大可用并行资源已无可重复收益，且已排查测试器本身限制。PCIe/NUMA 拓扑或设备能力形成的上限需有测量证据，不以总带宽平台形状直接推断。
-# GPU write payload
+## GPU write payload
 
 `gids_buffer_seed=20261014` initializes the GPU data pool with reproducible
 pseudorandom 64-bit words before I/O starts. With `gids_host_buffers=0`, slots

@@ -2,6 +2,7 @@
 #include "internal.hpp"
 #include "ap_plan.hpp"
 #include "pcie_config.h"
+#include "completion.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -19,7 +20,8 @@ struct gids {
     unsigned char *staging=nullptr;
     std::vector<void *> hosts;
     cudaStream_t stream=nullptr;
-    cudaEvent_t done=nullptr;
+    cudaEvent_t kernel_done=nullptr, done=nullptr;
+    GidsCompletion completion;
     std::string error;
     unsigned count=0;
     bool poisoned=false;
@@ -51,6 +53,7 @@ struct gids {
         if (h_ap) cudaFreeHost(h_ap);
         if (reference) cudaFree(reference);
         if (done) cudaEventDestroy(done);
+        if (kernel_done) cudaEventDestroy(kernel_done);
         if (stream) cudaStreamDestroy(stream);
         if (d_results) cudaFree(d_results);
         if (d_requests) cudaFree(d_requests);
@@ -144,6 +147,7 @@ extern "C" int gids_create(const gids_options *o, gids **out, gids_geometry *geo
         gpu_check(cudaMalloc(&s->allocation, s->stride*o->depth+65535), "allocate GPU data");
         s->data=reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(s->allocation)+65535)&~uintptr_t(65535));
         gpu_check(cudaStreamCreateWithFlags(&s->stream, cudaStreamNonBlocking), "create stream");
+        gpu_check(cudaEventCreateWithFlags(&s->kernel_done, cudaEventDisableTiming), "create kernel event");
         gpu_check(cudaEventCreateWithFlags(&s->done, cudaEventDisableTiming), "create event");
         gpu_check(cudaMallocHost((void **)&s->requests, o->depth*sizeof(Request)), "allocate request staging");
         gpu_check(cudaMallocHost((void **)&s->results, o->depth*sizeof(Result)), "allocate completion staging");
@@ -205,6 +209,7 @@ extern "C" int gids_file_geometry(gids *s,unsigned file,gids_geometry *out) {
 extern "C" int gids_prepare_file(gids *s,unsigned file,unsigned slot,void *host,
                                  uint64_t offset,unsigned bytes,int write) {
     if (s->poisoned) return EIO;
+    if (s->completion.active()) return EBUSY;
     gids_geometry geo{};
     int rc=gids_file_geometry(s,file,&geo);
     if (rc) return rc;
@@ -235,8 +240,10 @@ extern "C" int gids_prepare_file(gids *s,unsigned file,unsigned slot,void *host,
     } catch (const std::exception &e) { s->error=e.what(); return EIO; }
 }
 extern "C" int gids_submit(gids *s, unsigned count) {
+    if (s->completion.active()) return EBUSY;
     try {
         if (!count || count>s->opt.depth || s->poisoned) return EINVAL;
+        s->completion.begin();
         s->count=count;
         gpu_check(cudaSetDevice(s->opt.gpu), "select GPU");
         for (unsigned i=0;i<count;++i) if (s->staging && s->requests[i].write)
@@ -279,19 +286,20 @@ extern "C" int gids_submit(gids *s, unsigned count) {
                     gpu_check(cudaGetLastError(),"verify write readback launch");
                 }
             }
-            gpu_check(cudaMemcpyAsync(s->h_ap,s->d_ap,sizeof(ApSample),cudaMemcpyDeviceToHost,s->stream),"AP timestamps to host");
         } else s->backend->launch(count,s->d_requests,s->d_results,s->stream);
-        gpu_check(cudaMemcpyAsync(s->results,s->d_results,count*sizeof(Result),cudaMemcpyDeviceToHost,s->stream),"completion status to host");
-        for (unsigned i=0;i<count;++i) if (s->staging && !s->requests[i].write)
-            gpu_check(cudaMemcpyAsync(s->staging+i*s->stride,(char *)s->data+i*s->stride,s->requests[i].bytes,cudaMemcpyDeviceToHost,s->stream),"GPU read buffer for fio verification");
-        gpu_check(cudaEventRecord(s->done,s->stream),"record batch event");
+        // Poll this event before enqueuing any final D2H work. Each fio job
+        // retains its own stream and can return independently of slower jobs.
+        gpu_check(cudaEventRecord(s->kernel_done,s->stream),"record kernel event");
         return 0;
-    } catch (const std::exception &e) { s->error=e.what(); s->poisoned=true; return EIO; }
+    } catch (const std::exception &e) { s->completion.fail(); s->error=e.what(); s->poisoned=true; return EIO; }
 }
-extern "C" int gids_poll(gids *s) {
-    cudaError_t e=cudaEventQuery(s->done);
-    if (e==cudaErrorNotReady) return 0;
-    if (e!=cudaSuccess) { s->error=cudaGetErrorString(e); s->poisoned=true; return -EIO; }
+static bool event_ready(cudaEvent_t event) {
+    cudaError_t e=cudaEventQuery(event);
+    if (e==cudaErrorNotReady) return false;
+    gpu_check(e,"query batch event");
+    return true;
+}
+static void finish_batch(gids *s) {
     if(s->ap_file && !s->ap_written) {
         const auto &t=*s->h_ap;
         std::fprintf(s->ap_file,"%llu,%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu\n",
@@ -307,7 +315,24 @@ extern "C" int gids_poll(gids *s) {
         if (s->staging && !s->requests[i].write && !s->results[i].result)
             std::memcpy(s->hosts[i],s->staging+i*s->stride,s->requests[i].bytes);
     }
-    return 1;
+}
+extern "C" int gids_poll(gids *s) {
+    if (s->poisoned) return -EIO;
+    try {
+        gpu_check(cudaSetDevice(s->opt.gpu),"select completion GPU");
+        return s->completion.poll(
+            [&] { return event_ready(s->kernel_done); },
+            [&] {
+                if (s->ap_file)
+                    gpu_check(cudaMemcpyAsync(s->h_ap,s->d_ap,sizeof(ApSample),cudaMemcpyDeviceToHost,s->stream),"AP timestamps to host");
+                gpu_check(cudaMemcpyAsync(s->results,s->d_results,s->count*sizeof(Result),cudaMemcpyDeviceToHost,s->stream),"completion status to host");
+                for (unsigned i=0;i<s->count;++i) if (s->staging && !s->requests[i].write)
+                    gpu_check(cudaMemcpyAsync(s->staging+i*s->stride,(char *)s->data+i*s->stride,s->requests[i].bytes,cudaMemcpyDeviceToHost,s->stream),"GPU read buffer for fio verification");
+                gpu_check(cudaEventRecord(s->done,s->stream),"record copy event");
+            },
+            [&] { return event_ready(s->done); },
+            [&] { finish_batch(s); }) ? 1 : 0;
+    } catch (const std::exception &e) { s->completion.fail(); s->error=e.what(); s->poisoned=true; return -EIO; }
 }
 extern "C" int gids_result(gids *s, unsigned i) {
     if (!s->results[i].result) return 0;

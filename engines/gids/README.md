@@ -13,6 +13,11 @@ GiDS 测试无需模型、torch/vLLM 或 Tutti Python 包，本地测试盘无�
 
 建议顺序：编译并通过 `make -C engines/gids test` → 核对空闲 GPU 的可见编号/BDF → 验收所需的 PCIe 或 RDMA 路径。PCIe fio 会接管整个 NVMe 控制器，必须在同盘 daemon 已退出、文件系统卸载、其他使用者释放后运行。不要同时让两套程序接管同盘。
 
+验证范围见 [TESTING.md](TESTING.md#当前实现的验证范围)：当前 PCIe 读路径已有
+MACA 3.9.0.18 构建、数据校验及多 job 完成回传 A/B 证据；单数据 QP RDMA
+尚待真机验收，属于实验性路径。读测试不能代替新并行与完成路径的写入回归，
+短时吞吐结果也不代表全拓扑、长期稳定性或与 GPU 计算并行均已验收。
+
 本页与 [AP_LATENCY.md](AP_LATENCY.md) 提供参数化命令；运行 `examples/*.fio` 前，须按实际环境替换地址、NQN、盘名和 GPU。
 
 多卡多盘请接续 [2 GPU + 2 SSD 同时只读验收](MULTIGPU_MULTISSD.md)，使用两个显式映射的
@@ -26,6 +31,8 @@ job、独立 CSV 和逐 job 结果检查；包含参数化 fio 配置及扩展�
 * **rdma**：CPU 用 RDMA CM/verbs 完成连接、Fabrics Connect、Identify 和显存 MR 注册。每个 fio job 使用一个数据 RC QP，以及独立的管理连接。GPU 构造多条 NVMe keyed-SGL 命令、发布 mlx5 RQ/SQ、写 NIC UAR 门铃并轮询 CQ；按 CID 匹配响应，等待 SEND 与响应接收均完成后回收请求。目标端通过 RDMA READ/WRITE 直接访问 GPU 显存。每次数据 I/O 没有 CPU `ibv_post_send`/`ibv_poll_cq` 代理，没有 TCP 或主机数据中转回退。
 
 CPU 仍负责 fio 调度、批次 kernel launch 和状态回收。RDMA 队列页映射给 GPU，命令、响应及数据缓冲区位于 GPU 显存；显式关闭 CQE scatter，避免响应内联到主机 CQ。共享 UAR 使用独立 warp 发布门铃，避免同一 warp 的存储合并丢失门铃。相邻主机页在 MACA 上可能映射到不连续 GPU 地址，因此 SQ/RQ/CQ 按页寻址。
+
+每个 job 分两阶段回收：先轮询本批 kernel 的完成 event，完成后才向该 job 的非阻塞 stream 排入状态、可选 AP 时间戳及校验 payload 的 D2H；第二个 event 完成后才向 fio 返回结果。这样避免提前排入的慢批次回传阻挡其他 job 的状态回传。重复轮询不会重复提交复制，复制失败后停止复用该 adapter；清理仍等待 stream 并先拆除传输队列。AP 的初始化参考读取和写后校验仍保留原有同步检查。一个 job 内仍整批回收，此改动不等于逐请求完成或跨层流水线。
 
 使用 **MACA 3.9.0.18 或更新版本编译并运行**，并对目标 GPU 架构重新构建；只更换运行库不够。GiDS 使用原始 `cudaMalloc` 分配，不包含旧版 SDK 的 SQ/CQ 可见性 workaround。MACA 3.7.0 和 3.8.2 不在支持范围内。
 
@@ -116,7 +123,20 @@ sudo insmod engines/gids/build/module/snvme.ko
 
 ## NVMe/RDMA 环境
 
-需要 mlx5 RC/RoCE（IPv4）及能够为 MetaX 显存注册 MR 的 peer-memory 驱动。主机队列与 NIC UAR 必须能映射到 GPU；不满足时初始化报错。此实现不支持 TCP、iWARP、FC、TLS、DH-HMAC-CHAP 或目标硬件卸载。管理连接使用 KATO=0；要求强制 keepalive 的目标会拒绝连接。
+需要 mlx5 RC RDMA（IPv4 寻址）及能够为 MetaX 显存注册 MR 的 peer-memory 驱动。
+代码没有将链路限定为 RoCE；从 RDMA CM/RC QP 的使用方式看具备运行在
+InfiniBand 上的基础，但 **InfiniBand 兼容性尚待真机验证**，当前单数据 QP
+RDMA 后端也仍待完整验收，不能将接口兼容推断记作实测支持。
+
+在 InfiniBand 环境中，两端需运行 IPoIB，`gids_traddr` 填目标的 IPoIB IPv4
+地址，仍使用 `gids_transport=rdma`。IP 地址用于 RDMA CM 寻址，数据通路使用
+IB RC RDMA；当前参数不接受 IPv6 或直接填写 GID/LID。
+这符合 [RDMA CM 的 InfiniBand 地址解析要求](https://github.com/linux-rdma/rdma-core/blob/master/librdmacm/man/rdma_resolve_addr.3)。
+代码中的 `RDMA_PS_TCP` 表示可靠、面向连接的 RDMA 端口空间，并非 NVMe/TCP。
+
+主机队列与 NIC UAR 必须能映射到 GPU；不满足时初始化报错。此实现不支持
+NVMe/TCP、iWARP、FC、TLS、DH-HMAC-CHAP 或目标硬件卸载。管理连接使用 KATO=0；
+要求强制 keepalive 的目标会拒绝连接。
 
 目标机若已有兼容的 `nvmet-rdma`，直接建立 RDMA 监听即可。若系统使用 MLNX/DOCA OFED，而发行版 `nvmet-rdma` 报 RDMA 符号版本不匹配，可使用已安装的 OFED 源码额外构建目标模块：
 

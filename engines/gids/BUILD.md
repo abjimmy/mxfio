@@ -61,6 +61,12 @@ accompanying development packages. Compilation does not require a NIC;
 RDMA I/O requires an mlx5 device and GPU peer-memory registration support.
 Other vendors' NICs are not supported by this GPU queue implementation.
 
+The backend uses mlx5 RC RDMA with IPv4 addressing, without an explicit
+RoCE-only link restriction. InfiniBand compatibility remains unvalidated.
+For IB address resolution, both endpoints need IPoIB; use the target's
+IPoIB IPv4 address with `gids_transport=rdma`. IPv6 and direct GID/LID input
+are not accepted. See the [RDMA environment](README.md#nvmerdma-环境).
+
 ```bash
 make -C engines/gids GIDS_RDMA=mlx5 -j8
 ./fio --enghelp="$PWD/engines/gids/build/gids.so"

@@ -64,6 +64,8 @@ module:
 	bash ./build-module.sh
 test:
 	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/completion_test.cpp -o $(BUILD)/completion_test
+	$(BUILD)/completion_test
 	$(CC) -O2 -g -Wall -Wextra -Werror -Wno-unused-parameter -D_GNU_SOURCE -DFIO_INTERNAL -DGIDS_HAVE_MLX5=0 -I$(FIO_ROOT) -include $(FIO_ROOT)/config-host.h tests/scheduler_test.c -o $(BUILD)/scheduler_test
 	$(BUILD)/scheduler_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/pcie_batch_test.cpp -o $(BUILD)/pcie_batch_test
