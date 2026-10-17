@@ -25,6 +25,38 @@
 #define LOCKED   1
 #define UNLOCKED 0
 
+/* Optional bounded waits for a caller which will retire the entire QP on
+ * failure. Exhaustion is NOT cancellation: a CID, SQ ticket or CQ position
+ * already owned by the caller must not be returned to the allocator. The
+ * caller must check exhausted() before using a function's return value.
+ * A null context preserves the original unbounded API for other users. */
+class nvm_queue_wait {
+    uint32_t remaining_;
+    bool exhausted_ = false;
+public:
+    __forceinline__ __device__ explicit nvm_queue_wait(uint32_t budget)
+        : remaining_(budget) {}
+    __forceinline__ __device__ bool retry() {
+        if (remaining_ != 0) {
+            --remaining_;
+            return true;
+        }
+        exhausted_ = true;
+        return false;
+    }
+    __forceinline__ __device__ bool exhausted() const { return exhausted_; }
+};
+
+/* in_ticket is uint32_t, whereas each slot's generation advances twice
+ * per ring traversal. Compare in the same modular domain: for a 2^q ring
+ * the generation period is 2^(33-q). Keep the low busy bit as well. This
+ * also accepts the normalized generations written by the exclusive-owner
+ * GiDS pump, without rebasing a live SQ or changing the CQ phase. */
+__forceinline__ __device__
+uint32_t sq_ticket_mask(const nvm_queue_t* sq) {
+    return ((UINT32_MAX >> sq->qs_log2) << 1) | 1u;
+}
+
 __forceinline__ __device__ uint64_t get_id(uint64_t x, uint64_t y) {
     //return (x >> y);
     return (x >> y) * 2;  // (x/2^y) *2
@@ -33,7 +65,7 @@ __forceinline__ __device__ uint64_t get_id(uint64_t x, uint64_t y) {
 
 
 inline __device__
-uint16_t get_cid(nvm_queue_t* sq) {
+uint16_t get_cid(nvm_queue_t* sq, nvm_queue_wait* wait = NULL) {
     bool not_found = true;
     uint16_t id;
 
@@ -43,6 +75,7 @@ uint16_t get_cid(nvm_queue_t* sq) {
         //printf("in thread: %p\n", (void*) ((sq->cid)+id));
         uint64_t old = sq->cid[id].val.fetch_or(LOCKED, cuda::memory_order_acquire);
         not_found = old == LOCKED;
+        if (not_found && wait && !wait->retry()) return 0;
         //if (not_found)
         //       printf("still looking\n");
     } while (not_found);
@@ -166,7 +199,7 @@ uint32_t move_head_sq(nvm_queue_t* q, uint32_t cur_head) {
 typedef ulonglong4 copy_type;
 
 __forceinline__ __device__
-uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda::thread_scope_device>* pc_tail =NULL, uint64_t * cur_pc_tail=NULL) {
+uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda::thread_scope_device>* pc_tail =NULL, uint64_t * cur_pc_tail=NULL, nvm_queue_wait* wait = NULL) {
 
     //uint32_t mask = __activemask();
     //uint32_t active_count = __popc(mask);
@@ -183,10 +216,12 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda
 
     uint32_t pos = ticket & (sq->qs_minus_1);
     uint64_t id = get_id(ticket, sq->qs_log2);
+    const uint32_t generation_mask = sq_ticket_mask(sq);
 
     //uint64_t k = 0;
     unsigned int ns = 8;
-    while ((sq->tickets[pos].val.load(cuda::memory_order_relaxed) != id) ) {
+    while ((sq->tickets[pos].val.load(cuda::memory_order_relaxed) & generation_mask) != id) {
+        if (wait && !wait->retry()) return 0;
         /*if (k++ % 100 == 0)   {
             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
@@ -202,7 +237,8 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda
     }
 
     ns = 8;
-    while ((sq->tickets[pos].val.load(cuda::memory_order_acquire) != id) ) {
+    while ((sq->tickets[pos].val.load(cuda::memory_order_acquire) & generation_mask) != id) {
+        if (wait && !wait->retry()) return 0;
         /*if (k++ % 100 == 0)   {
             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
@@ -329,6 +365,9 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda
         }
         cont = sq->tail_mark[pos].val.load(cuda::memory_order_relaxed) == LOCKED;
         if (cont) {
+            /* The ticket/SQE may already be visible to another publisher.
+             * Do not roll it back, unlock its CID, or reuse its payload. */
+            if (wait && !wait->retry()) return 0;
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
             __nanosleep(ns);
             if (ns < 256) {
@@ -500,12 +539,13 @@ uint32_t cq_poll_bounded(nvm_queue_t* cq, uint16_t search_cid,
 }
 
 __forceinline__ __device__
-void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) {
+void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0, nvm_queue_wait* wait = NULL) {
     cq->tail.fetch_add(1, cuda::memory_order_acq_rel);
 
     unsigned int ns = 8;
     // unsigned int k=0;
     while ((cq->pos_locks[pos].val.load(cuda::memory_order_relaxed) != 0) ) {
+        if (wait && !wait->retry()) return;
         // if(k++ % 100 == 0)   {
         //     printf("cq_dequeue 1\n");
         // }
@@ -525,6 +565,7 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 
 
     ns = 8;
     while ((cq->pos_locks[pos].val.fetch_or(1, cuda::memory_order_acquire) != 0) ) {
+        if (wait && !wait->retry()) return;
         // if(k++ % 100 == 0)   {
         //     printf("cq_dequeue 2\n");
         // }
@@ -542,7 +583,12 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 
 #endif
     }
 
-    //uint32_t pos = cq_poll(cq, cid);
+    /* No one else may acknowledge our CQE. Reconstruct its absolute
+     * position before publishing its mark; this works for both the legacy
+     * default arguments and callers which supplied an older head snapshot.
+     * The CQ head cannot pass this position until our mark is consumed. */
+    cur_head_ = cq->head.load(cuda::memory_order_acquire);
+    loc_ = cur_head_ + ((uint32_t(pos) - cur_head_) & cq->qs_minus_1);
     cq->head_mark[pos].val.store(LOCKED, cuda::memory_order_release);
 
 
@@ -578,6 +624,10 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 
             }
             cont = cq->head_mark[pos].val.load(cuda::memory_order_relaxed) == LOCKED;
             if (cont) {
+                /* A timed-out worker can leave an earlier, late CQE at the
+                 * head. Exit with this position and CID still quarantined
+                 * instead of waiting forever for the missing owner. */
+                if (wait && !wait->retry()) return;
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
                 __nanosleep(ns);
                 if (ns < 256) {
@@ -588,35 +638,23 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 
     }
 
 
-	uint64_t j = 0;
-    uint32_t new_head = cq->head.load(cuda::memory_order_relaxed);
+    uint32_t new_head = cq->head.load(cuda::memory_order_acquire);
     ns = 8;
 //    uint32_t cur_head_mod = cur_head_ & (cq->qs_minus_1);
-    do {
-        //      uint32_t new_head_mod = new_head & (cq->qs_minus_1);
-
-        if (new_head > cur_head_) {
-            if ((loc_ >= cur_head_) && (loc_ < new_head))
-                break;
-
-
-        }
-        else if (new_head < cur_head_) {
-            if ((loc_ >= cur_head_))
-                break;
-            if (loc_ < new_head)
-                break;
-        }
-
-        j++;
-        new_head = cq->head.load(cuda::memory_order_relaxed);
+    /* Clearing head_mark precedes the doorbell/head publication by the
+     * lock owner. Wait for that publication before releasing the position.
+     * Unsigned distances also cover UINT32_MAX -> 0; direct ordering or
+     * the old default loc_=cur_head_=0 can deadlock at that boundary. */
+    while (uint32_t(new_head - cur_head_) <= uint32_t(loc_ - cur_head_)) {
+        if (wait && !wait->retry()) return;
+        new_head = cq->head.load(cuda::memory_order_acquire);
 #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
         __nanosleep(ns);
         if (ns < 256) {
             ns *= 2;
         }
 #endif
-    } while(true);
+    }
 
     cq->pos_locks[pos].val.store(0, cuda::memory_order_release);
 }

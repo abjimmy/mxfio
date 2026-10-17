@@ -18,7 +18,8 @@ script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fio_root=${FIO_ROOT:-$script_root}
 spdk_root=${SPDK_ROOT:-/workspace/spdk-ap-baseline}
 gpu=${BASELINE_GPU:-0}  # Logical ordinal; confirm the selected physical PCI BDF.
-export LD_LIBRARY_PATH=/opt/maca/lib:/opt/mxdriver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+maca_path=${MACA_PATH:-/opt/maca}
+export LD_LIBRARY_PATH="$maca_path/lib:/opt/mxdriver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 extra=()
 preload=()
 case "$mode" in

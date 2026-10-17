@@ -27,6 +27,11 @@ SDK、驱动、设备拓扑、块大小、队列深度、请求数和缓存状�
 `percentage_random=0`、`rw_sequencer=identical`，在一次打开期间重复访问同一个偏移。
 它固定使用 CPU 0；先确认该 CPU 可用，并检查脚本内的实际配置。
 
+脚本优先将 `${MACA_PATH}/lib` 放入 `LD_LIBRARY_PATH`，随后是 `/opt/mxdriver/lib`
+和已有的库路径；`MACA_PATH` 未设置或为空时默认使用 `/opt/maca/lib`。
+选择非默认 SDK 时，运行前导出与构建 fio/mcFile 引擎相同的 `MACA_PATH`，
+避免运行时加载其他 SDK 的库，并随结果保存 SDK 路径及版本。
+
 以下命令从仓库根目录执行，设备已恢复内核 `nvme` 绑定且没有 GiDS/daemon 接管：
 
 ```bash

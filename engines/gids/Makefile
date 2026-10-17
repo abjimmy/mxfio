@@ -74,6 +74,8 @@ test:
 	$(BUILD)/pcie_plan_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -pthread tests/worker_pool_test.cpp -o $(BUILD)/worker_pool_test
 	$(BUILD)/worker_pool_test
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-unused-parameter -Itests/queue_mock -I$(V) -I$(NVM)/include tests/shared_queue_test.cpp -o $(BUILD)/shared_queue_test
+	$(BUILD)/shared_queue_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/rdma_batch_test.cpp -o $(BUILD)/rdma_batch_test
 	$(BUILD)/rdma_batch_test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror tests/wire_test.cpp -o $(BUILD)/wire_test

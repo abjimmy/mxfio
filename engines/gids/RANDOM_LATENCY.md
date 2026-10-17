@@ -6,7 +6,7 @@
 
 每组一个 job、`thread=1`、`iodepth=1`；建议先测 4 KiB，再测 128 KiB。
 默认生成 5200 笔请求并剔除最初 200 笔预热，报告剩余全部样本。
-生成器按块大小对齐，在 `[0, capacity)` 内均匀有放回抽样，末尾不越界；
+生成器默认按块大小对齐，在 `[0, capacity)` 内均匀有放回抽样，末尾不越界；
 固定 seed 可重放同一序列。全盘地址抽样不表示访问每个扇区，也不是稳态预处理。
 
 ## 测量和校验方法
@@ -44,7 +44,7 @@ bs=4096
 prefix="$(mktemp -d /srv/tutti/logs/ap-random-XXXXXX)/read-4k"
 python3 engines/gids/scripts/make_ap_plan.py \
   --capacity="$capacity" --bs="$bs" --count=5200 --seed=20260921 \
-  --operation=read --filename="$dev" --prefix="$prefix"
+  --operation=read --filename="$dev" --prefix="$prefix" > "$prefix-plan.json"
 ./fio --readonly --name=ap-random --thread=1 --iodepth=1 \
   --ioengine="$PWD/engines/gids/build-random/gids.so" \
   --gids_gpu="${GIDS_GPU:?}" --gids_transport=pcie --filename="$dev" \
@@ -70,13 +70,39 @@ RDMA 先用 `make -C engines/gids BUILD=build-random GIDS_RDMA=mlx5 -j8` 启用 
 
 读计划最多 65,536 笔且参考副本不超过 2 GiB；写计划最多 65,536 笔、只保留一块参考数据。计划容量必须与控制器 Identify/实际块设备容量一致，偏移按请求块大小及 namespace LBA 对齐。新增 AP 随机计时需要计划重放；普通 GiDS 引擎的 `randread/randwrite` 功能不受此限制。
 
+## 选择活动地址范围
+
+生成器的 `--active-offset` 和 `--active-length` 分别指定活动范围的起始字节和长度，
+不改变 `--capacity`：容量始终填写真实 namespace 字节数，并保留在 V1 计划头中。
+起始偏移必须非负，显式长度必须为正，二者均须按 `bs` 对齐且整个范围不超出容量。
+不指定偏移时从 0 开始；不指定长度时使用从偏移到 namespace 末尾的全部完整块，
+忽略不足一个 `bs` 的尾部。省略两个参数时与原先的全 namespace 抽样序列一致。
+
+例如在 namespace 前 50% 的完整块中抽样，使用新 prefix，并将上面的生成命令改为：
+
+```bash
+active_length=$((capacity / 2 / bs * bs))
+python3 engines/gids/scripts/make_ap_plan.py \
+  --capacity="$capacity" --bs="$bs" --count=5200 --seed=20260921 \
+  --active-offset=0 --active-length="$active_length" \
+  --operation=read --filename="$dev" --prefix="$prefix" > "$prefix-plan.json"
+```
+
+plan 和 fio iolog 使用完全相同的绝对字节偏移；fio 的 `--size` 继续使用真实容量，
+无需额外设置 fio `offset`。生成器 JSON 记录 `namespace_bytes`、`active_offset`、
+`active_length` 和不包含在范围内的 `active_end`，保存它以明确实际测试范围。
+
+活动范围是本次随机访问的工作集，**不等于 SSD 的有效 LBA 占用率**。
+缩小范围不会清空范围之外的 LBA，也不会建立 50% 或 90% 的有效数据占用状态。
+有效占用及稳态预处理需要单独建立并记录；读计划应限制在已写入、状态符合预期的范围。
+
 ## 验收和解释
 
 逐笔核对 CSV 与计划的操作、偏移和长度，要求全部 `status=0`、`mismatches=0`，
-实际完成计数与计划一致。保存计划、iolog、CSV、fio JSON、源码版本和设备身份。
+实际完成计数与计划一致。保存计划、生成器 JSON、iolog、CSV、fio JSON、源码版本和设备身份。
 初始化参考预读及每笔写后的验证读不属于 fio 计时请求计数。
 
-比较结果时保持 seed、容量、块大小、GPU、队列深度及 SSD 预处理状态一致。
+比较结果时保持 seed、容量、活动范围、块大小、GPU、队列深度及 SSD 预处理状态一致。
 参考预读会影响缓存；低队深且插入校验读的写入不能外推为连续纯写性能。
 固定 LBA 与随机地址、不同设备之间的延迟不应直接相减解释为某个单独组件的开销。
 测试结束检查控制器驱动绑定、GPU 进程以及 SSD 健康状态，见 [RECOVERY.md](RECOVERY.md)。

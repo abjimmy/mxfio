@@ -167,7 +167,7 @@ RDMA 监听地址、端口、NQN 和 host ACL 必须按实际目标配置填写�
 | gids_subnqn | 无 | RDMA 目标 NQN |
 | gids_hostnqn | /etc/nvme/hostnqn 内容 | RDMA host NQN |
 | gids_timeout_ms | 30000 | RDMA 建连与管理命令的毫秒超时 |
-| gids_poll_budget | 1000000 | GPU 无进展轮询的迭代上限；不是毫秒。批次每次成功提交或处理完成记录都会重置计数；QD1 AP 按单请求计数 |
+| gids_poll_budget | 1000000 | GPU 等待重试预算；不是毫秒。batched 每次成功提交或处理完成记录都会重置计数；workers/AP 分别限制提交（CID/SQ）、CQ 查找和 CQ 回收阶段的等待 |
 | gids_host_buffers | 0 | 复制 fio 缓冲区供校验/指定写模式；verify 自动启用 |
 | gids_submit_mode | batched | PCIe：batched 每个活跃 QP 一个线程批量推进；workers 多线程复用 Tutti 共享 QP 原语 |
 | gids_qps | 1 | PCIe 每文件、每 job 的 SQ/CQ 对数，1..32；实际控制器配额不足时报错 |
@@ -181,7 +181,7 @@ RDMA 监听地址、端口、NQN 和 host ACL 必须按实际目标配置填写�
 * RDMA 同样每 job 一个数据 QP、`iodepth=1..65536`。物理在途窗口受 target、NIC 和 GPU 队列页表容量限制，当前最多 256 个请求；更大的 fio 批次在同一 QP 内分段推进。初始化日志打印实际 SQ/RQ/CQ 容量和 `outstanding_limit`，不因提高 `iodepth` 而创建更多 QP。
 * 每个 job 只允许一个在途批次，整批完成并被 fio 回收后才复用缓冲区。多个 job 可独立推进。这个完成模型不同于逐请求完成后立即从 fio 补入新请求的模型。
 * fio `slat` 结束于主机提交函数返回，`clat` 覆盖其后的 GPU 工作及主机观察到完成的时间；两者都不是 GPU 内部 SQ→CQ 时间。设备内部时间使用 QD1 AP 测量。吞吐/延迟包含 fio 调度、kernel launch 和完成回收开销。
-* 支持顺序/随机 read、write、randrw 等数据 I/O，拒绝 trim、flush/fsync、ZBD、verify_async。不支持自动重连；GPU 轮询超时/传输错误后停止该上下文，清理资源，再启动新 job。
+* 支持顺序/随机 read、write、randrw 等数据 I/O，拒绝 trim、flush/fsync、ZBD、verify_async。同步写和刷盘选项 `sync=1/sync/dsync`、`fsync`、`fdatasync`、`end_fsync`、`end_syncfs`、`fsync_on_close`、`sync_file_range`、`write_barrier` 在初始化时明确拒绝，避免将普通 NVMe 写误记为具有这些语义的写入。不支持自动重连；GPU 轮询超时/传输错误后停止该上下文，清理资源，再启动新 job。
 * RDMA 必须显式给出 `size`，实际 offset、长度按 Identify 返回的容量及 LBA 对齐检查。最大 bs 同时受 MDTS、PRP/SGL、NVMe NLB 字段约束；RDMA 不支持 metadata/protection information。
 * 默认 GPU 写缓冲区仅用于测试，不具有应用数据语义。示例只读；需要写入时应明确选择已允许覆盖的测试范围。
 
@@ -252,7 +252,8 @@ Tutti 的逐层 event 或 GPU 计算负载。这种独立 job 方式可与上述
 公开基线为 xPU-IO/Tutti 的 `c4f19b6fca524e020c1233e817dabb89bb35d3a3`。
 Tutti 的 LICENSE 随源码保留。
 
-`vendor/manifest.json` 的 `local_changes` 记录 MACA 主机编译别名和计时单位转换；
+`vendor/manifest.json` 的 `local_changes` 记录 MACA 主机编译别名、计时单位转换，
+以及共享 NVMe 队列的有界等待和 32 位计数回绕修复；
 `sha256` 覆盖全部 vendored 文件。
 `scripts/check_vendor.py` 校验文件集合和内容，`import_provenance` 保留原始导入记录。
 依赖构建见 [vendor/README.md](vendor/README.md)，计时语义见 [AP_LATENCY.md](AP_LATENCY.md)。

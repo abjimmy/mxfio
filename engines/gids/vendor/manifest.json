@@ -14,6 +14,14 @@
         "csrc/include/tutti/gpu_vendor/maca_primitives.h": {
             "description": "Implement the MACA device timer required by NVMe GPU compilation, with a 64-bit nanosecond contract.",
             "base_sha256": "5357b89310e04b224af0e4e0569bc51210c9704c132465bc0f612935ee312627"
+        },
+        "csrc/device_manager/nvme/libnvm/include/nvm_parallel_queue.h": {
+            "description": "Bound optional shared-queue waits without releasing in-flight resources; compare SQ generations and CQ positions in their 32-bit modular domains.",
+            "base_sha256": "7af4badb749c35394c63e0620dbff27a701701b33f224564d8521839fd2dac84"
+        },
+        "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh": {
+            "description": "Apply wait budgets to CID/SQ submission and CQ reclamation; report timeout status while retaining resources until the owning QP is retired.",
+            "base_sha256": "42dd1c11169d589e5484a756d2fee3f6ff7cc388c87b3588067acfdc9aaa6226"
         }
     },
     "sha256": {
@@ -22,7 +30,7 @@
         "csrc/data_paths/local_nvme/io/device_target.h": "3820d6f8717b0eca47bd36a3bb70ea44d27802ae1fc2df963b4b8f5b9bdb44e5",
         "csrc/data_paths/local_nvme/io/nvme_queue_group.cu": "bf9931986b3587dde1caec638e8cf428d298a683ed9fb7a4d81e811e94c0f0ca",
         "csrc/data_paths/local_nvme/io/nvme_queue_group.h": "c44ed1a1eec287ea98525c713caf8234cab8f5c7a7583466818f02fbeea9c03d",
-        "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh": "42dd1c11169d589e5484a756d2fee3f6ff7cc388c87b3588067acfdc9aaa6226",
+        "csrc/data_paths/local_nvme/io/nvme_submit_primitives.cuh": "190382928da3d184168f7c0943fb5ca5efcd6862b2118e27d14a465607904bd5",
         "csrc/data_paths/local_nvme/io/prp_builder.h": "8837cf5ae239878399aaf7b6f8c14e931a251e48ac2468b96527879ede5508c5",
         "csrc/data_paths/local_nvme/io/submit_one.cu": "69fd859fd6eea1955327b6e8824a753ec49f512d0f5f1cde40a5032a1ab5ccc5",
         "csrc/data_paths/local_nvme/io/submit_one.cuh": "c5951756b4a18ea3a8b6416a9a5e8f349b146f8433c735bd9b6d99e7bba35331",
@@ -116,7 +124,7 @@
         "csrc/device_manager/nvme/libnvm/include/nvm_ctrl.h": "c77d3c1aa46b22b2789c7ff3528b96cdbcf94617d0bceeeca1ae93b47370ece8",
         "csrc/device_manager/nvme/libnvm/include/nvm_dma.h": "37cd7c51474a4c9df205b0d44fc1226ca1397b283f9f388af701de0e0b9360d0",
         "csrc/device_manager/nvme/libnvm/include/nvm_error.h": "b00fd89013dc064e5847816265c694b6a81df7783012d26c789c167467ae501e",
-        "csrc/device_manager/nvme/libnvm/include/nvm_parallel_queue.h": "7af4badb749c35394c63e0620dbff27a701701b33f224564d8521839fd2dac84",
+        "csrc/device_manager/nvme/libnvm/include/nvm_parallel_queue.h": "9a515c05faca78724697b0a78c8dc47f564d622a2ce3f0c49332b16633623e4c",
         "csrc/device_manager/nvme/libnvm/include/nvm_queue.h": "8b9e935c5fdc8140d57c3b10893ec1b9d4aa5d973e5f2c9ef2adedc41656a519",
         "csrc/device_manager/nvme/libnvm/include/nvm_types.h": "fd7f981d13ee415f6f346e7149651247c08467d81dd3da8e223231c51b8a0811",
         "csrc/device_manager/nvme/libnvm/include/nvm_util.h": "b32d3140502ff1161fab29fac805d55f9200e76d1ab7007944568480105332f6",

@@ -17,8 +17,9 @@
 //     resolve_lba, submit_read_one, submit_write_one.  Pulls in libnvm
 //     device headers; must NOT be included from plain .cpp files.
 //
-// No behavioral change to LocalNvmeDataPath — every function below is
-// byte-for-byte identical to what used to live directly in submit_one.cuh.
+// GiDS local change: bound allocation, publication and reclamation waits
+// as well as CQ polling. A timeout poisons the owning QP; it is not an
+// NVMe abort and never permits reuse of outstanding DMA resources.
 
 #include <cstdint>
 
@@ -31,7 +32,7 @@ namespace tutti::data_paths::local_nvme {
 // device kernel and read back by the host after the stream event signals.
 //
 //   result: 0 = success, 1 = resolve_lba failure,
-//           2 = CQ timeout, 3 = NVMe CQ error status (non-zero SCT/SC),
+//           2 = queue wait timeout, 3 = NVMe CQ error status (non-zero SCT/SC),
 //           UINT32_MAX = pending / kernel did not execute this entry
 //   nvme_status_dword3: raw CQE dword[3] for error diagnostics (0 if ok)
 // -------------------------------------------------------------------------
@@ -87,21 +88,29 @@ public:
     static void release_queue(std::uint32_t /*queue_idx*/) {}
 
     TUTTI_DEVICE TUTTI_FORCEINLINE
-    static void issue_nvme_cmd(QueuePair* qp,
+    static bool issue_nvme_cmd(QueuePair* qp,
                                std::uint64_t  prp1,
                                std::uint64_t  prp2,
                                std::uint64_t  n_blocks,
                                std::uint64_t  starting_lba,
                                std::uint8_t   opcode,
-                               std::uint16_t* cid_out)
+                               std::uint16_t* cid_out,
+                               std::uint32_t  wait_budget)
     {
+        nvm_queue_wait wait(wait_budget);
         nvm_cmd_t cmd;
         nvm_cmd_clear(&cmd);           // zero-init entire 64-byte SQE
-        *cid_out = get_cid(&qp->sq);
+        const std::uint16_t cid = get_cid(&qp->sq, &wait);
+        if (wait.exhausted()) return false; // No CID or SQ ticket acquired.
+        *cid_out = cid;
         nvm_cmd_header  (&cmd, *cid_out, opcode, qp->nvmNamespace);
         nvm_cmd_data_ptr(&cmd, prp1, prp2);
         nvm_cmd_rw_blks (&cmd, starting_lba, n_blocks);
-        sq_enqueue(&qp->sq, &cmd);
+        sq_enqueue(&qp->sq, &cmd, nullptr, nullptr, &wait);
+        /* Once an SQ ticket is reserved there may be a gap, or another
+         * producer may already have published our SQE. In either case keep
+         * this CID allocated and retire the QP; never roll back or retry. */
+        return !wait.exhausted();
     }
 
     // Bounded poll: returns the real CQ slot on completion (whether or not
@@ -122,7 +131,12 @@ public:
         nvm_cpl_t* cpl = (nvm_cpl_t*)qp->cq.vaddr;
         uint32_t cpl_entry = cpl[loc].dword[3];
         *out_status_dword3 = cpl_entry;
-        cq_dequeue(&qp->cq, loc, &qp->sq);
+        nvm_queue_wait wait(cq_poll_budget);
+        cq_dequeue(&qp->cq, loc, &qp->sq, 0, 0, &wait);
+        if (wait.exhausted()) {
+            if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
+            return NVM_CQ_TIMEOUT; // Keep the CID and CQ position quarantined.
+        }
         put_cid(&qp->sq, cid);
         if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
         return loc;
@@ -238,9 +252,12 @@ void submit_read_one(const DeviceTargetHandle* h,
     const std::uint32_t qidx = QueueAcquireHelper::acquire_queue(h->num_d_qps);
     QueuePair* qp = &h->d_qps[qidx];
     std::uint16_t cid = 0;
-    QueueAcquireHelper::issue_nvme_cmd(
+    if (!QueueAcquireHelper::issue_nvme_cmd(
         qp, prp1, prp2, n_blocks, starting_lba,
-        (std::uint8_t)NVM_IO_READ, &cid);
+        (std::uint8_t)NVM_IO_READ, &cid, cq_poll_budget)) {
+        if (status) { status->result = 2; status->nvme_status_dword3 = 0; }
+        return;
+    }
     if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
 
     std::uint32_t status_dword3 = 0;
@@ -285,9 +302,12 @@ void submit_write_one(const DeviceTargetHandle* h,
     const std::uint32_t qidx = QueueAcquireHelper::acquire_queue(h->num_d_qps);
     QueuePair* qp = &h->d_qps[qidx];
     std::uint16_t cid = 0;
-    QueueAcquireHelper::issue_nvme_cmd(
+    if (!QueueAcquireHelper::issue_nvme_cmd(
         qp, prp1, prp2, n_blocks, starting_lba,
-        (std::uint8_t)NVM_IO_WRITE, &cid);
+        (std::uint8_t)NVM_IO_WRITE, &cid, cq_poll_budget)) {
+        if (status) { status->result = 2; status->nvme_status_dword3 = 0; }
+        return;
+    }
     if (timing) timing[1] = TUTTI_GLOBALTIMER_NS();
 
     std::uint32_t status_dword3 = 0;

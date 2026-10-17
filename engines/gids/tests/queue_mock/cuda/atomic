@@ -1,0 +1,14 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#pragma once
+#include <atomic>
+
+/* CPU stand-in for the SDK atomic API, not a model of GPU/PCIe ordering. */
+namespace cuda {
+enum thread_scope { thread_scope_device, thread_scope_system };
+using std::memory_order_relaxed;
+using std::memory_order_acquire;
+using std::memory_order_release;
+using std::memory_order_acq_rel;
+using std::memory_order_seq_cst;
+template<class T, thread_scope Scope> using atomic = std::atomic<T>;
+}

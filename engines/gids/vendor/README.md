@@ -1,8 +1,9 @@
 # Standalone Tutti vendor build
 
 Build and check the Tutti dependencies used by GiDS. `Tutti/` contains
-complete upstream files with the MACA adaptations recorded in
-`manifest.json`, together with the file set and normalized SHA-256 hashes.
+complete upstream files with the MACA adaptations and shared NVMe queue
+fixes recorded in `manifest.json`, together with the file set and normalized
+SHA-256 hashes.
 
 The public source base is xPU-IO/Tutti
 `c4f19b6fca524e020c1233e817dabb89bb35d3a3`. This is not a full Tutti checkout:

@@ -177,8 +177,40 @@ static void multiple_files(void)
     opts.submit_mode="invalid"; assert(setup(&td));
     cleanup(&td); assert(!td.io_ops_data); td.files=files;
 }
+static void unsupported_sync_options(void)
+{
+    memset(&td,0,sizeof(td)); memset(&opts,0,sizeof(opts));
+    created=destroyed=0;
+    opts.transport="pcie"; td.eo=&opts;
+    td.o.use_thread=td.o.nr_files=td.o.iodepth=1;
+    td.o.create_fsync=1; /* fio's default is unrelated to data I/O flushes. */
+    const enum td_ddir directions[]={TD_DDIR_READ,TD_DDIR_WRITE,TD_DDIR_RANDRW};
+    for (unsigned i=0; i<sizeof(directions)/sizeof(*directions); ++i) {
+        td.o.td_ddir=directions[i]; assert(!setup(&td));
+    }
+    td.o.td_ddir=TD_DDIR_WRITE;
+
+    /* fio maps sync=1 and sync=sync to O_SYNC, sync=dsync to O_DSYNC. */
+    td.o.sync_io=O_SYNC; assert(setup(&td));
+#ifdef O_DSYNC
+    td.o.sync_io=O_DSYNC; assert(setup(&td));
+#endif
+    td.o.sync_io=0; assert(!setup(&td));
+
+    unsigned *flush_options[]={
+        &td.o.fsync_blocks, &td.o.fdatasync_blocks, &td.o.end_fsync,
+        &td.o.end_syncfs, &td.o.fsync_on_close, &td.o.sync_file_range,
+        &td.sync_file_range_nr, &td.o.barrier_blocks
+    };
+    for (unsigned i=0; i<sizeof(flush_options)/sizeof(*flush_options); ++i) {
+        *flush_options[i]=1; assert(setup(&td));
+        *flush_options[i]=0; assert(!setup(&td));
+    }
+    assert(!created && !destroyed && !td.io_ops_data);
+}
 int main(void)
 {
     depths_and_partial_events(); failures(); limits_and_timestamps(); multiple_files();
+    unsupported_sync_options();
     puts("scheduler callbacks: PASS"); return 0;
 }

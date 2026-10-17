@@ -63,6 +63,16 @@ struct state {
 static int setup(struct thread_data *td)
 {
     struct options *o = td->eo;
+    if (td->o.sync_io) {
+        log_err("gids: sync=1/sync/dsync is unsupported; synchronous write durability is not implemented\n");
+        return 1;
+    }
+    if (td->o.fsync_blocks || td->o.fdatasync_blocks || td->o.end_fsync ||
+        td->o.end_syncfs || td->o.fsync_on_close || td->o.sync_file_range ||
+        td->sync_file_range_nr || td->o.barrier_blocks) {
+        log_err("gids: fsync, fdatasync, end_fsync, end_syncfs, fsync_on_close, sync_file_range and write_barrier are unsupported\n");
+        return 1;
+    }
     if (o->submit_mode && strcmp(o->submit_mode,"batched") && strcmp(o->submit_mode,"workers")) {
         log_err("gids: gids_submit_mode must be batched or workers\n"); return 1;
     }
